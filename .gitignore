@@ -3,3 +3,5 @@ frontend/
 !frontend/.keep
 excalidraw-complete
 .codex-briefs/
+frontend/*
+!frontend/.keep
