@@ -1,7 +1,7 @@
 From 1f58045a06d272c9a824b7b46a2589fe93d577e0 Mon Sep 17 00:00:00 2001
 From: Michael Be <m.gonser@icloud.com>
 Date: Tue, 11 Aug 2026 12:09:55 +0200
-Subject: [PATCH 1/3] feat: add project & file explorer panel
+Subject: [PATCH 1/4] feat: add project & file explorer panel
  (Excalidraw-Plus-style)
 
 Left-docked Files panel with project/file tree backed by /api/explorer:
@@ -1500,7 +1500,7 @@ index 0000000..fd2b326
 From 880c7a4f4d64a6aa2c37b0ccad4bacb17aa849b5 Mon Sep 17 00:00:00 2001
 From: Michael Be <m.gonser@icloud.com>
 Date: Tue, 11 Aug 2026 13:07:56 +0200
-Subject: [PATCH 2/3] fix: explorer E2E findings (autosave loop, stale canvas,
+Subject: [PATCH 2/4] fix: explorer E2E findings (autosave loop, stale canvas,
  dark mode, tree state, z-order)
 
 - content-based dirty detection via scene fingerprint instead of marking
@@ -1760,7 +1760,7 @@ index 93c6bf6..5f02d54 100644
 From 7811a7222381bcc1edd4becc92372f939b39dce4 Mon Sep 17 00:00:00 2001
 From: Michael Be <m.gonser@icloud.com>
 Date: Tue, 11 Aug 2026 13:55:03 +0200
-Subject: [PATCH 3/3] feat: explorer drag & drop and custom dialogs
+Subject: [PATCH 3/4] feat: explorer drag & drop and custom dialogs
 
 - name/delete dialogs built on the package's Dialog/ConfirmDialog/TextField
   (validation, Enter/Escape, autofocus, cascade warning); no native
@@ -2537,6 +2537,961 @@ index 5f02d54..5472438 100644
      </>
    );
  };
+-- 
+2.39.5 (Apple Git-154)
+
+
+From 56d5ce84f2572d20329c13a28c30afd3eecc1e69 Mon Sep 17 00:00:00 2001
+From: Michael Be <m.gonser@icloud.com>
+Date: Tue, 11 Aug 2026 14:53:38 +0200
+Subject: [PATCH 4/4] feat: integrate explorer into native open flow and main
+ menu
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- optional onOpenSceneRequest prop on Excalidraw (fork-friendly 12-line hook
+  in actionLoadScene) so menu Open, Ctrl/Cmd+O and the welcome screen show
+  the explorer picker dialog instead of the native file picker
+- picker dialog with project/file tree and 'Von Gerät öffnen…' fallback that
+  flushes and detaches the active explorer file before applying a scene
+  loaded from disk (prevents autosave from overwriting the explorer file)
+- 'In Projekt speichern…' / 'Kopie speichern in…' main-menu entry saves the
+  current scene as a new explorer file (existing or new project), makes it
+  the active file and refreshes the panel
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ excalidraw-app/App.tsx                        | 108 +++++++
+ excalidraw-app/components/AppMainMenu.tsx     |  13 +-
+ .../components/explorer/ExplorerDialogs.scss  | 137 +++++++++
+ .../explorer/ExplorerOpenDialog.tsx           | 275 ++++++++++++++++++
+ .../components/explorer/ExplorerPanel.tsx     |  20 ++
+ .../explorer/ExplorerSaveToProjectDialog.tsx  | 181 ++++++++++++
+ packages/excalidraw/actions/actionExport.tsx  |   4 +
+ packages/excalidraw/index.tsx                 |   2 +
+ packages/excalidraw/types.ts                  |   6 +
+ 9 files changed, 745 insertions(+), 1 deletion(-)
+ create mode 100644 excalidraw-app/components/explorer/ExplorerOpenDialog.tsx
+ create mode 100644 excalidraw-app/components/explorer/ExplorerSaveToProjectDialog.tsx
+
+diff --git a/excalidraw-app/App.tsx b/excalidraw-app/App.tsx
+index 1357a4c..8c7f63b 100644
+--- a/excalidraw-app/App.tsx
++++ b/excalidraw-app/App.tsx
+@@ -119,6 +119,11 @@ import {
+   ExplorerPanel,
+   ExplorerSaveStatus,
+ } from "./components/explorer/ExplorerPanel";
++import { ExplorerOpenDialog } from "./components/explorer/ExplorerOpenDialog";
++import {
++  ExplorerSaveToProjectDialog,
++  ExplorerSaveToProjectOptions,
++} from "./components/explorer/ExplorerSaveToProjectDialog";
+ 
+ polyfill();
+ 
+@@ -334,6 +339,10 @@ const ExcalidrawWrapper = () => {
+     useState<ExplorerFileMeta | null>(null);
+   const [explorerSaveStatus, setExplorerSaveStatus] =
+     useState<ExplorerSaveStatus>(activeExplorerFileId ? "saved" : "idle");
++  const [isOpenSceneDialogOpen, setIsOpenSceneDialogOpen] = useState(false);
++  const [isSaveToProjectDialogOpen, setIsSaveToProjectDialogOpen] =
++    useState(false);
++  const [explorerPanelRefreshToken, setExplorerPanelRefreshToken] = useState(0);
+   const activeExplorerFileIdRef = useRef(activeExplorerFileId);
+   const explorerSceneRef = useRef<ExplorerScene | null>(null);
+   const explorerSavedSceneFingerprintRef = useRef<string | null>(null);
+@@ -359,6 +368,11 @@ const ExcalidrawWrapper = () => {
+     }
+   }, []);
+ 
++  const handleOpenSceneRequest = useCallback(() => {
++    setIsOpenSceneDialogOpen(true);
++    return true;
++  }, []);
++
+   const showExplorerError = useCallback(
+     (message: string) => {
+       excalidrawAPI?.setToast({ message });
+@@ -927,6 +941,75 @@ const ExcalidrawWrapper = () => {
+     ],
+   );
+ 
++  const detachExplorerFileForDeviceScene = useCallback(async () => {
++    if (!activeExplorerFileIdRef.current) {
++      return true;
++    }
++    if (!(await flushExplorerSave())) {
++      return false;
++    }
++    clearActiveExplorerFile();
++    return true;
++  }, [clearActiveExplorerFile, flushExplorerSave]);
++
++  const saveSceneToNewExplorerFile = useCallback(
++    async (options: ExplorerSaveToProjectOptions) => {
++      if (!excalidrawAPI) {
++        return false;
++      }
++
++      if (!(await flushExplorerSave())) {
++        return false;
++      }
++
++      try {
++        let projectId = options.projectId;
++        if (!projectId) {
++          if (!options.newProjectName) {
++            return false;
++          }
++          const project = await explorerApi.createProject(
++            options.newProjectName,
++          );
++          projectId = project.id;
++        }
++
++        const scene = createExplorerScene(
++          excalidrawAPI.getSceneElementsIncludingDeleted(),
++          excalidrawAPI.getAppState(),
++          excalidrawAPI.getFiles(),
++        );
++        const newFile = await explorerApi.createFile(
++          projectId,
++          options.fileName,
++          scene,
++        );
++
++        setActiveExplorerFile(newFile);
++        explorerSceneRef.current = scene;
++        explorerSavedSceneFingerprintRef.current = JSON.stringify(scene);
++        explorerBaselinePendingRef.current = false;
++        explorerDirtyRef.current = false;
++        setExplorerSaveStatus("saved");
++        setExplorerPanelRefreshToken((current) => current + 1);
++        return true;
++      } catch (caught) {
++        showExplorerError(
++          `Zeichnung konnte nicht im Projekt gespeichert werden: ${getExplorerErrorMessage(
++            caught,
++          )}`,
++        );
++        return false;
++      }
++    },
++    [
++      excalidrawAPI,
++      flushExplorerSave,
++      setActiveExplorerFile,
++      showExplorerError,
++    ],
++  );
++
+   useEffect(() => {
+     return () => {
+       if (explorerSaveTimerRef.current !== null) {
+@@ -1028,6 +1111,7 @@ const ExcalidrawWrapper = () => {
+       <Excalidraw
+         excalidrawAPI={excalidrawRefCallback}
+         onChange={onChange}
++        onOpenSceneRequest={handleOpenSceneRequest}
+         initialData={initialStatePromiseRef.current.promise}
+         isCollaborating={isCollaborating}
+         onPointerUpdate={collabAPI?.onPointerUpdate}
+@@ -1089,6 +1173,7 @@ const ExcalidrawWrapper = () => {
+         <ExplorerPanel
+           activeFileId={activeExplorerFileId}
+           activeProjectId={activeExplorerFile?.projectId || null}
++          refreshToken={explorerPanelRefreshToken}
+           isCollaborating={isCollaborating}
+           saveStatus={explorerSaveStatus}
+           onOpenFile={openExplorerFile}
+@@ -1096,10 +1181,33 @@ const ExcalidrawWrapper = () => {
+           onActiveFileMetaChange={setActiveExplorerFile}
+           onError={showExplorerError}
+         />
++        {isOpenSceneDialogOpen && excalidrawAPI && (
++          <ExplorerOpenDialog
++            activeFileId={activeExplorerFileId}
++            activeProjectId={activeExplorerFile?.projectId || null}
++            excalidrawAPI={excalidrawAPI}
++            onSelectFile={openExplorerFile}
++            onBeforeApplyDeviceScene={detachExplorerFileForDeviceScene}
++            onCloseRequest={() => setIsOpenSceneDialogOpen(false)}
++            onError={showExplorerError}
++          />
++        )}
++        {isSaveToProjectDialogOpen && excalidrawAPI && (
++          <ExplorerSaveToProjectDialog
++            initialFileName={
++              activeExplorerFile?.name || excalidrawAPI.getName() || "Unbenannt"
++            }
++            onSave={saveSceneToNewExplorerFile}
++            onCloseRequest={() => setIsSaveToProjectDialogOpen(false)}
++            onError={showExplorerError}
++          />
++        )}
+         <AppMainMenu
+           onCollabDialogOpen={onCollabDialogOpen}
+           isCollaborating={isCollaborating}
+           isCollabEnabled={!isCollabDisabled}
++          activeExplorerFile={activeExplorerFile}
++          onSaveToProject={() => setIsSaveToProjectDialogOpen(true)}
+         />
+         <AppWelcomeScreen
+           onCollabDialogOpen={onCollabDialogOpen}
+diff --git a/excalidraw-app/components/AppMainMenu.tsx b/excalidraw-app/components/AppMainMenu.tsx
+index 6806c96..69f3491 100644
+--- a/excalidraw-app/components/AppMainMenu.tsx
++++ b/excalidraw-app/components/AppMainMenu.tsx
+@@ -1,17 +1,28 @@
+ import React from "react";
+-import { PlusPromoIcon } from "../../packages/excalidraw/components/icons";
++import {
++  PlusPromoIcon,
++  saveAs,
++} from "../../packages/excalidraw/components/icons";
+ import { MainMenu } from "../../packages/excalidraw/index";
++import type { ExplorerFileMeta } from "../data/explorer";
+ import { LanguageList } from "./LanguageList";
+ 
+ export const AppMainMenu: React.FC<{
+   onCollabDialogOpen: () => any;
+   isCollaborating: boolean;
+   isCollabEnabled: boolean;
++  activeExplorerFile: ExplorerFileMeta | null;
++  onSaveToProject: () => void;
+ }> = React.memo((props) => {
+   return (
+     <MainMenu>
+       <MainMenu.DefaultItems.LoadScene />
+       <MainMenu.DefaultItems.SaveToActiveFile />
++      <MainMenu.Item icon={saveAs} onSelect={props.onSaveToProject}>
++        {props.activeExplorerFile
++          ? "Kopie speichern in…"
++          : "In Projekt speichern…"}
++      </MainMenu.Item>
+       <MainMenu.DefaultItems.Export />
+       <MainMenu.DefaultItems.SaveAsImage />
+       {props.isCollabEnabled && (
+diff --git a/excalidraw-app/components/explorer/ExplorerDialogs.scss b/excalidraw-app/components/explorer/ExplorerDialogs.scss
+index da227e1..7215e81 100644
+--- a/excalidraw-app/components/explorer/ExplorerDialogs.scss
++++ b/excalidraw-app/components/explorer/ExplorerDialogs.scss
+@@ -38,4 +38,141 @@
+       font-weight: 600;
+     }
+   }
++
++  .ExplorerOpenDialog__tree {
++    max-height: min(25rem, 55vh);
++    overflow: auto;
++    padding: 0.35rem;
++    border: 1px solid var(--sidebar-border-color);
++    border-radius: var(--border-radius-lg);
++    background: var(--color-surface-low);
++  }
++
++  .ExplorerOpenDialog__project {
++    margin-bottom: 0.2rem;
++  }
++
++  .ExplorerOpenDialog__projectRow,
++  .ExplorerOpenDialog__fileRow {
++    display: flex;
++    align-items: center;
++    gap: 0.45rem;
++    width: 100%;
++    min-width: 0;
++    height: 2.25rem;
++    padding: 0 0.55rem;
++    border: 0;
++    border-radius: var(--border-radius-md);
++    background: transparent;
++    color: var(--color-on-surface);
++    font: inherit;
++    text-align: left;
++
++    &:hover:not(:disabled) {
++      background: var(--color-surface-high);
++    }
++  }
++
++  .ExplorerOpenDialog__projectRow {
++    font-weight: 600;
++  }
++
++  .ExplorerOpenDialog__fileRow {
++    padding-left: 2.25rem;
++
++    &.active {
++      background: var(--color-surface-primary-container);
++      color: var(--color-on-primary-container);
++    }
++
++    &:disabled {
++      cursor: wait;
++    }
++  }
++
++  .ExplorerOpenDialog__chevron {
++    width: 0.65rem;
++    color: var(--color-muted-darker);
++    text-align: center;
++  }
++
++  .ExplorerOpenDialog__name {
++    overflow: hidden;
++    text-overflow: ellipsis;
++    white-space: nowrap;
++  }
++
++  .ExplorerOpenDialog__opening {
++    margin-left: auto;
++    color: var(--color-muted-darker);
++    font-size: 0.75rem;
++  }
++
++  .ExplorerOpenDialog__message {
++    padding: 0.75rem;
++    color: var(--color-muted-darker);
++    font-size: 0.8rem;
++    line-height: 1.4;
++  }
++
++  .ExplorerOpenDialog__error,
++  .ExplorerSaveToProjectDialog__error {
++    display: flex;
++    align-items: center;
++    justify-content: space-between;
++    gap: 0.75rem;
++    margin-bottom: 0.5rem;
++    padding: 0.65rem 0.75rem;
++    border-radius: var(--border-radius-md);
++    background: var(--color-danger-background);
++    color: var(--color-danger-color);
++    font-size: 0.75rem;
++
++    button {
++      flex: 0 0 auto;
++      padding: 0;
++      border: 0;
++      background: transparent;
++      color: inherit;
++      font: inherit;
++      font-weight: 600;
++      text-decoration: underline;
++    }
++  }
++
++  .ExplorerSaveToProjectDialog {
++    form {
++      display: flex;
++      flex-direction: column;
++      gap: 0.85rem;
++    }
++  }
++
++  .ExplorerSaveToProjectDialog__selectLabel {
++    display: flex;
++    flex-direction: column;
++    gap: 0.35rem;
++    color: var(--color-on-surface);
++    font-size: 0.75rem;
++
++    select {
++      width: 100%;
++      height: 2.5rem;
++      padding: 0 0.65rem;
++      border: 1px solid var(--default-border-color);
++      border-radius: var(--border-radius-md);
++      background: var(--input-bg-color);
++      color: var(--color-on-surface);
++      font: inherit;
++      font-size: 0.875rem;
++    }
++  }
++
++  .ExplorerSaveToProjectDialog__validation {
++    min-height: 1.25rem;
++    margin-top: -0.6rem;
++    color: var(--color-muted-darker);
++    font-size: 0.75rem;
++    text-align: right;
++  }
+ }
+diff --git a/excalidraw-app/components/explorer/ExplorerOpenDialog.tsx b/excalidraw-app/components/explorer/ExplorerOpenDialog.tsx
+new file mode 100644
+index 0000000..64ad4a2
+--- /dev/null
++++ b/excalidraw-app/components/explorer/ExplorerOpenDialog.tsx
+@@ -0,0 +1,275 @@
++import clsx from "clsx";
++import { useCallback, useEffect, useState } from "react";
++
++import { Dialog } from "../../../packages/excalidraw/components/Dialog";
++import DialogActionButton from "../../../packages/excalidraw/components/DialogActionButton";
++import { loadFromJSON } from "../../../packages/excalidraw/data";
++import type { ExcalidrawImperativeAPI } from "../../../packages/excalidraw/types";
++import {
++  ExplorerFileMeta,
++  ExplorerProject,
++  explorerApi,
++  getExplorerErrorMessage,
++} from "../../data/explorer";
++
++import "./ExplorerDialogs.scss";
++
++type ExplorerOpenDialogProps = {
++  activeFileId: string | null;
++  activeProjectId: string | null;
++  excalidrawAPI: ExcalidrawImperativeAPI;
++  onSelectFile: (fileId: string) => Promise<void>;
++  // Muss die aktive Explorer-Datei flushen und lösen, bevor eine von der
++  // Festplatte geladene Szene den Canvas ersetzt — sonst würde der Autosave
++  // die Explorer-Datei mit der fremden Szene überschreiben. false = abbrechen.
++  onBeforeApplyDeviceScene: () => Promise<boolean>;
++  onCloseRequest: () => void;
++  onError: (message: string) => void;
++};
++
++const sortByName = <T extends { name: string }>(items: T[]) =>
++  [...items].sort((a, b) => a.name.localeCompare(b.name));
++
++export const ExplorerOpenDialog = ({
++  activeFileId,
++  activeProjectId,
++  excalidrawAPI,
++  onSelectFile,
++  onBeforeApplyDeviceScene,
++  onCloseRequest,
++  onError,
++}: ExplorerOpenDialogProps) => {
++  const [projects, setProjects] = useState<ExplorerProject[]>([]);
++  const [filesByProject, setFilesByProject] = useState<
++    Record<string, ExplorerFileMeta[]>
++  >({});
++  const [expandedProjects, setExpandedProjects] = useState<Set<string>>(
++    () => new Set(activeProjectId ? [activeProjectId] : []),
++  );
++  const [loadingProjects, setLoadingProjects] = useState(true);
++  const [loadingFileProjects, setLoadingFileProjects] = useState<Set<string>>(
++    new Set(),
++  );
++  const [openingFileId, setOpeningFileId] = useState<string | null>(null);
++  const [isOpeningDeviceFile, setIsOpeningDeviceFile] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++
++  const reportError = useCallback(
++    (caught: unknown) => {
++      const message = getExplorerErrorMessage(caught);
++      setError(message);
++      onError(message);
++    },
++    [onError],
++  );
++
++  const loadFiles = useCallback(
++    async (projectId: string) => {
++      setLoadingFileProjects((current) => new Set(current).add(projectId));
++      try {
++        const files = await explorerApi.getFiles(projectId);
++        setFilesByProject((current) => ({
++          ...current,
++          [projectId]: sortByName(files),
++        }));
++      } catch (caught) {
++        reportError(caught);
++      } finally {
++        setLoadingFileProjects((current) => {
++          const next = new Set(current);
++          next.delete(projectId);
++          return next;
++        });
++      }
++    },
++    [reportError],
++  );
++
++  const loadProjects = useCallback(async () => {
++    setLoadingProjects(true);
++    setError(null);
++    try {
++      const loadedProjects = sortByName(await explorerApi.getProjects());
++      setProjects(loadedProjects);
++      if (
++        activeProjectId &&
++        loadedProjects.some((project) => project.id === activeProjectId)
++      ) {
++        await loadFiles(activeProjectId);
++      }
++    } catch (caught) {
++      reportError(caught);
++    } finally {
++      setLoadingProjects(false);
++    }
++  }, [activeProjectId, loadFiles, reportError]);
++
++  useEffect(() => {
++    void loadProjects();
++  }, [loadProjects]);
++
++  const toggleProject = (projectId: string) => {
++    const isExpanded = expandedProjects.has(projectId);
++    setExpandedProjects((current) => {
++      const next = new Set(current);
++      isExpanded ? next.delete(projectId) : next.add(projectId);
++      return next;
++    });
++    if (!isExpanded && !filesByProject[projectId]) {
++      void loadFiles(projectId);
++    }
++  };
++
++  const openExplorerFile = async (fileId: string) => {
++    if (openingFileId || isOpeningDeviceFile) {
++      return;
++    }
++    setOpeningFileId(fileId);
++    await onSelectFile(fileId);
++    onCloseRequest();
++  };
++
++  const openDeviceFile = async () => {
++    if (openingFileId || isOpeningDeviceFile) {
++      return;
++    }
++    setIsOpeningDeviceFile(true);
++    try {
++      const loaded = await loadFromJSON(
++        excalidrawAPI.getAppState(),
++        excalidrawAPI.getSceneElements(),
++      );
++      if (!(await onBeforeApplyDeviceScene())) {
++        return;
++      }
++      excalidrawAPI.updateScene({
++        elements: loaded.elements,
++        appState: loaded.appState,
++        commitToHistory: true,
++      });
++      excalidrawAPI.addFiles(Object.values(loaded.files || {}));
++    } catch (caught) {
++      if (
++        caught &&
++        typeof caught === "object" &&
++        "name" in caught &&
++        caught.name === "AbortError"
++      ) {
++        console.warn(caught);
++      } else {
++        const message =
++          caught instanceof Error
++            ? caught.message
++            : "Datei konnte nicht geöffnet werden.";
++        excalidrawAPI.updateScene({ appState: { errorMessage: message } });
++        onError(message);
++      }
++    } finally {
++      onCloseRequest();
++    }
++  };
++
++  return (
++    <Dialog
++      className="ExplorerOpenDialog"
++      size="small"
++      title="Zeichnung öffnen"
++      onCloseRequest={onCloseRequest}
++    >
++      <div className="ExplorerOpenDialog__tree">
++        {error && (
++          <div className="ExplorerOpenDialog__error">
++            <span>{error}</span>
++            <button type="button" onClick={() => void loadProjects()}>
++              Erneut versuchen
++            </button>
++          </div>
++        )}
++
++        {loadingProjects && projects.length === 0 ? (
++          <div className="ExplorerOpenDialog__message">
++            Projekte werden geladen…
++          </div>
++        ) : projects.length === 0 && !error ? (
++          <div className="ExplorerOpenDialog__message">
++            Noch keine Projekte vorhanden.
++          </div>
++        ) : (
++          projects.map((project) => {
++            const isExpanded = expandedProjects.has(project.id);
++            const files = filesByProject[project.id] || [];
++            return (
++              <section className="ExplorerOpenDialog__project" key={project.id}>
++                <button
++                  className="ExplorerOpenDialog__projectRow"
++                  type="button"
++                  aria-expanded={isExpanded}
++                  onClick={() => toggleProject(project.id)}
++                >
++                  <span className="ExplorerOpenDialog__chevron" aria-hidden>
++                    {isExpanded ? "▾" : "▸"}
++                  </span>
++                  <span aria-hidden>▰</span>
++                  <span className="ExplorerOpenDialog__name">
++                    {project.name}
++                  </span>
++                </button>
++
++                {isExpanded && (
++                  <div className="ExplorerOpenDialog__files">
++                    {loadingFileProjects.has(project.id) ? (
++                      <div className="ExplorerOpenDialog__message">
++                        Dateien werden geladen…
++                      </div>
++                    ) : files.length === 0 ? (
++                      <div className="ExplorerOpenDialog__message">
++                        Keine Zeichnungen in diesem Projekt.
++                      </div>
++                    ) : (
++                      files.map((file) => (
++                        <button
++                          className={clsx("ExplorerOpenDialog__fileRow", {
++                            active: file.id === activeFileId,
++                          })}
++                          type="button"
++                          key={file.id}
++                          aria-current={
++                            file.id === activeFileId ? "page" : undefined
++                          }
++                          disabled={Boolean(
++                            openingFileId || isOpeningDeviceFile,
++                          )}
++                          onClick={() => void openExplorerFile(file.id)}
++                        >
++                          <span aria-hidden>◇</span>
++                          <span className="ExplorerOpenDialog__name">
++                            {file.name}
++                          </span>
++                          {openingFileId === file.id && (
++                            <span className="ExplorerOpenDialog__opening">
++                              Öffnet…
++                            </span>
++                          )}
++                        </button>
++                      ))
++                    )}
++                  </div>
++                )}
++              </section>
++            );
++          })
++        )}
++      </div>
++
++      <div className="ExplorerDialog__buttons">
++        <DialogActionButton label="Abbrechen" onClick={onCloseRequest} />
++        <DialogActionButton
++          label="Von Gerät öffnen…"
++          disabled={Boolean(openingFileId || isOpeningDeviceFile)}
++          isLoading={isOpeningDeviceFile}
++          onClick={() => void openDeviceFile()}
++        />
++      </div>
++    </Dialog>
++  );
++};
+diff --git a/excalidraw-app/components/explorer/ExplorerPanel.tsx b/excalidraw-app/components/explorer/ExplorerPanel.tsx
+index 5472438..4ee79e7 100644
+--- a/excalidraw-app/components/explorer/ExplorerPanel.tsx
++++ b/excalidraw-app/components/explorer/ExplorerPanel.tsx
+@@ -37,6 +37,7 @@ type DeleteDialogState =
+ type ExplorerPanelProps = {
+   activeFileId: string | null;
+   activeProjectId: string | null;
++  refreshToken: number;
+   isCollaborating: boolean;
+   saveStatus: ExplorerSaveStatus;
+   onOpenFile: (fileId: string) => Promise<void>;
+@@ -64,6 +65,7 @@ const setDropEffect = (
+ export const ExplorerPanel = ({
+   activeFileId,
+   activeProjectId,
++  refreshToken,
+   isCollaborating,
+   saveStatus,
+   onOpenFile,
+@@ -98,6 +100,7 @@ export const ExplorerPanel = ({
+   );
+   const draggedFileRef = useRef<ExplorerFileMeta | null>(null);
+   const suppressFileClickRef = useRef(false);
++  const previousRefreshTokenRef = useRef(refreshToken);
+ 
+   const reportError = useCallback(
+     (caught: unknown) => {
+@@ -147,6 +150,23 @@ export const ExplorerPanel = ({
+     }
+   }, [error, hasLoadedProjects, isOpen, loadProjects, loadingProjects]);
+ 
++  useEffect(() => {
++    if (previousRefreshTokenRef.current === refreshToken) {
++      return;
++    }
++    previousRefreshTokenRef.current = refreshToken;
++
++    if (!isOpen) {
++      setHasLoadedProjects(false);
++      return;
++    }
++
++    void loadProjects();
++    expandedProjects.forEach((projectId) => {
++      void loadFiles(projectId);
++    });
++  }, [expandedProjects, isOpen, loadFiles, loadProjects, refreshToken]);
++
+   useEffect(() => {
+     if (
+       !hasLoadedProjects ||
+diff --git a/excalidraw-app/components/explorer/ExplorerSaveToProjectDialog.tsx b/excalidraw-app/components/explorer/ExplorerSaveToProjectDialog.tsx
+new file mode 100644
+index 0000000..c1c05fa
+--- /dev/null
++++ b/excalidraw-app/components/explorer/ExplorerSaveToProjectDialog.tsx
+@@ -0,0 +1,181 @@
++import { FormEvent, useCallback, useEffect, useState } from "react";
++
++import { Dialog } from "../../../packages/excalidraw/components/Dialog";
++import DialogActionButton from "../../../packages/excalidraw/components/DialogActionButton";
++import { TextField } from "../../../packages/excalidraw/components/TextField";
++import {
++  ExplorerProject,
++  explorerApi,
++  getExplorerErrorMessage,
++} from "../../data/explorer";
++
++import "./ExplorerDialogs.scss";
++
++export type ExplorerSaveToProjectOptions = {
++  fileName: string;
++  projectId: string | null;
++  newProjectName: string | null;
++};
++
++type ExplorerSaveToProjectDialogProps = {
++  initialFileName: string;
++  onSave: (options: ExplorerSaveToProjectOptions) => Promise<boolean>;
++  onCloseRequest: () => void;
++  onError: (message: string) => void;
++};
++
++const MAX_NAME_LENGTH = 200;
++const NEW_PROJECT_VALUE = "__new_project__";
++
++const sortByName = <T extends { name: string }>(items: T[]) =>
++  [...items].sort((a, b) => a.name.localeCompare(b.name));
++
++const isValidName = (name: string) => {
++  const normalizedName = name.trim();
++  return normalizedName.length > 0 && normalizedName.length <= MAX_NAME_LENGTH;
++};
++
++export const ExplorerSaveToProjectDialog = ({
++  initialFileName,
++  onSave,
++  onCloseRequest,
++  onError,
++}: ExplorerSaveToProjectDialogProps) => {
++  const [projects, setProjects] = useState<ExplorerProject[]>([]);
++  const [projectChoice, setProjectChoice] = useState("");
++  const [newProjectName, setNewProjectName] = useState("");
++  const [fileName, setFileName] = useState(initialFileName);
++  const [isLoading, setIsLoading] = useState(true);
++  const [isSaving, setIsSaving] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++
++  const loadProjects = useCallback(async () => {
++    setIsLoading(true);
++    setError(null);
++    try {
++      const loadedProjects = sortByName(await explorerApi.getProjects());
++      setProjects(loadedProjects);
++      setProjectChoice(
++        (current) => current || loadedProjects[0]?.id || NEW_PROJECT_VALUE,
++      );
++    } catch (caught) {
++      const message = getExplorerErrorMessage(caught);
++      setError(message);
++      onError(message);
++    } finally {
++      setIsLoading(false);
++    }
++  }, [onError]);
++
++  useEffect(() => {
++    void loadProjects();
++  }, [loadProjects]);
++
++  const normalizedFileName = fileName.trim();
++  const normalizedProjectName = newProjectName.trim();
++  const isNewProject = projectChoice === NEW_PROJECT_VALUE;
++  const isValid =
++    isValidName(normalizedFileName) &&
++    (isNewProject
++      ? isValidName(normalizedProjectName)
++      : projects.some((project) => project.id === projectChoice));
++
++  const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
++    event.preventDefault();
++    if (!isValid || isSaving) {
++      return;
++    }
++
++    setIsSaving(true);
++    const didSave = await onSave({
++      fileName: normalizedFileName,
++      projectId: isNewProject ? null : projectChoice,
++      newProjectName: isNewProject ? normalizedProjectName : null,
++    });
++    if (didSave) {
++      onCloseRequest();
++    } else {
++      setIsSaving(false);
++    }
++  };
++
++  return (
++    <Dialog
++      className="ExplorerSaveToProjectDialog"
++      size="small"
++      title="In Projekt speichern"
++      onCloseRequest={onCloseRequest}
++    >
++      <form onSubmit={(event) => void handleSubmit(event)}>
++        <label className="ExplorerSaveToProjectDialog__selectLabel">
++          <span>Projekt</span>
++          <select
++            value={projectChoice}
++            disabled={isLoading || isSaving}
++            onChange={(event) => setProjectChoice(event.target.value)}
++          >
++            {isLoading && <option value="">Projekte werden geladen…</option>}
++            {projects.map((project) => (
++              <option key={project.id} value={project.id}>
++                {project.name}
++              </option>
++            ))}
++            <option value={NEW_PROJECT_VALUE}>Neues Projekt…</option>
++          </select>
++        </label>
++
++        {isNewProject && (
++          <TextField
++            fullWidth
++            label="Name des neuen Projekts"
++            value={newProjectName}
++            onChange={setNewProjectName}
++            selectOnRender
++          />
++        )}
++
++        <TextField
++          fullWidth
++          label="Dateiname"
++          value={fileName}
++          onChange={setFileName}
++          selectOnRender={!isNewProject}
++        />
++
++        <div
++          className="ExplorerSaveToProjectDialog__validation"
++          aria-live="polite"
++        >
++          {normalizedFileName.length > MAX_NAME_LENGTH ||
++          (isNewProject && normalizedProjectName.length > MAX_NAME_LENGTH)
++            ? `Maximal ${MAX_NAME_LENGTH} Zeichen erlaubt.`
++            : `${normalizedFileName.length}/${MAX_NAME_LENGTH}`}
++        </div>
++
++        {error && (
++          <div className="ExplorerSaveToProjectDialog__error">
++            <span>{error}</span>
++            <button type="button" onClick={() => void loadProjects()}>
++              Erneut versuchen
++            </button>
++          </div>
++        )}
++
++        <div className="ExplorerDialog__buttons">
++          <DialogActionButton
++            label="Abbrechen"
++            disabled={isSaving}
++            onClick={onCloseRequest}
++          />
++          <DialogActionButton
++            actionType="primary"
++            disabled={!isValid || isLoading || isSaving}
++            isLoading={isSaving}
++            label={isSaving ? "Speichert…" : "Speichern"}
++            type="submit"
++          />
++        </div>
++      </form>
++    </Dialog>
++  );
++};
+diff --git a/packages/excalidraw/actions/actionExport.tsx b/packages/excalidraw/actions/actionExport.tsx
+index 7cb6b12..a7d4808 100644
+--- a/packages/excalidraw/actions/actionExport.tsx
++++ b/packages/excalidraw/actions/actionExport.tsx
+@@ -237,6 +237,10 @@ export const actionLoadScene = register({
+     );
+   },
+   perform: async (elements, appState, _, app) => {
++    if (app.props.onOpenSceneRequest?.()) {
++      return false;
++    }
++
+     try {
+       const {
+         elements: loadedElements,
+diff --git a/packages/excalidraw/index.tsx b/packages/excalidraw/index.tsx
+index e1dc29e..31b742b 100644
+--- a/packages/excalidraw/index.tsx
++++ b/packages/excalidraw/index.tsx
+@@ -23,6 +23,7 @@ polyfill();
+ const ExcalidrawBase = (props: ExcalidrawProps) => {
+   const {
+     onChange,
++    onOpenSceneRequest,
+     initialData,
+     excalidrawAPI,
+     isCollaborating = false,
+@@ -110,6 +111,7 @@ const ExcalidrawBase = (props: ExcalidrawProps) => {
+       <InitializeApp langCode={langCode} theme={theme}>
+         <App
+           onChange={onChange}
++          onOpenSceneRequest={onOpenSceneRequest}
+           initialData={initialData}
+           excalidrawAPI={excalidrawAPI}
+           isCollaborating={isCollaborating}
+diff --git a/packages/excalidraw/types.ts b/packages/excalidraw/types.ts
+index d7f701f..3ce72ef 100644
+--- a/packages/excalidraw/types.ts
++++ b/packages/excalidraw/types.ts
+@@ -418,6 +418,12 @@ export interface ExcalidrawProps {
+     appState: AppState,
+     files: BinaryFiles,
+   ) => void;
++  /**
++   * Optional hook to let the host app take over scene loading (for example,
++   * by showing a custom Open picker). Return true when the request was
++   * handled, or false to fall back to the native file picker.
++   */
++  onOpenSceneRequest?: () => boolean;
+   initialData?: MaybePromise<ExcalidrawInitialDataState | null>;
+   excalidrawAPI?: (api: ExcalidrawImperativeAPI) => void;
+   isCollaborating?: boolean;
 -- 
 2.39.5 (Apple Git-154)
 
