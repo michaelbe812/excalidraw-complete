@@ -1,7 +1,7 @@
 From 1f58045a06d272c9a824b7b46a2589fe93d577e0 Mon Sep 17 00:00:00 2001
 From: Michael Be <m.gonser@icloud.com>
 Date: Tue, 11 Aug 2026 12:09:55 +0200
-Subject: [PATCH] feat: add project & file explorer panel
+Subject: [PATCH 1/2] feat: add project & file explorer panel
  (Excalidraw-Plus-style)
 
 Left-docked Files panel with project/file tree backed by /api/explorer:
@@ -1493,6 +1493,266 @@ index 0000000..fd2b326
 +
 +export const getExplorerErrorMessage = (error: unknown) =>
 +  error instanceof Error ? error.message : "Unbekannter Explorer-Fehler";
+-- 
+2.39.5 (Apple Git-154)
+
+
+From 880c7a4f4d64a6aa2c37b0ccad4bacb17aa849b5 Mon Sep 17 00:00:00 2001
+From: Michael Be <m.gonser@icloud.com>
+Date: Tue, 11 Aug 2026 13:07:56 +0200
+Subject: [PATCH 2/2] fix: explorer E2E findings (autosave loop, stale canvas,
+ dark mode, tree state, z-order)
+
+- content-based dirty detection via scene fingerprint instead of marking
+  every onChange dirty; save no longer re-triggers itself via state updates
+- clearing the active file now resets the canvas and pauses the
+  localStorage fallback while an explorer file is open
+- panel/context menu use sidebar/popup background tokens (dark mode)
+- active file's project auto-expands after reload
+- panel z-index 3: above the interactive canvas, below the layer UI so the
+  main menu dropdown stays usable while the panel is open
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ excalidraw-app/App.tsx                        | 81 ++++++++++++++-----
+ .../components/explorer/ExplorerPanel.scss    | 19 +++--
+ .../components/explorer/ExplorerPanel.tsx     | 31 +++++++
+ 3 files changed, 107 insertions(+), 24 deletions(-)
+
+diff --git a/excalidraw-app/App.tsx b/excalidraw-app/App.tsx
+index 9024cb9..1357a4c 100644
+--- a/excalidraw-app/App.tsx
++++ b/excalidraw-app/App.tsx
+@@ -336,6 +336,8 @@ const ExcalidrawWrapper = () => {
+     useState<ExplorerSaveStatus>(activeExplorerFileId ? "saved" : "idle");
+   const activeExplorerFileIdRef = useRef(activeExplorerFileId);
+   const explorerSceneRef = useRef<ExplorerScene | null>(null);
++  const explorerSavedSceneFingerprintRef = useRef<string | null>(null);
++  const explorerBaselinePendingRef = useRef(Boolean(activeExplorerFileId));
+   const explorerSaveTimerRef = useRef<number | null>(null);
+   const explorerDirtyRef = useRef(false);
+   const explorerSaveInFlightRef = useRef<Promise<boolean> | null>(null);
+@@ -379,16 +381,18 @@ const ExcalidrawWrapper = () => {
+     }
+ 
+     setExplorerSaveStatus("saving");
++    const sceneFingerprint = JSON.stringify(scene);
+     const savePromise = explorerApi
+       .updateFile(fileId, { data: scene })
+-      .then((updated) => {
+-        if (
+-          activeExplorerFileIdRef.current === fileId &&
+-          explorerSceneRef.current === scene
+-        ) {
+-          explorerDirtyRef.current = false;
+-          setExplorerSaveStatus("saved");
+-          setActiveExplorerFileState(updated);
++      .then(() => {
++        if (activeExplorerFileIdRef.current === fileId) {
++          explorerSavedSceneFingerprintRef.current = sceneFingerprint;
++          const currentScene = explorerSceneRef.current;
++          const hasUnsavedChanges =
++            currentScene !== null &&
++            JSON.stringify(currentScene) !== sceneFingerprint;
++          explorerDirtyRef.current = hasUnsavedChanges;
++          setExplorerSaveStatus(hasUnsavedChanges ? "pending" : "saved");
+         }
+         return true;
+       })
+@@ -427,9 +431,15 @@ const ExcalidrawWrapper = () => {
+     }
+     explorerDirtyRef.current = false;
+     explorerSceneRef.current = null;
++    explorerSavedSceneFingerprintRef.current = null;
++    explorerBaselinePendingRef.current = false;
+     setActiveExplorerFile(null);
+     setExplorerSaveStatus("idle");
+-  }, [setActiveExplorerFile]);
++    if (excalidrawAPI) {
++      excalidrawAPI.resetScene({ resetLoadingState: true });
++      excalidrawAPI.history.clear();
++    }
++  }, [excalidrawAPI, setActiveExplorerFile]);
+ 
+   useHandleLibrary({
+     excalidrawAPI,
+@@ -528,6 +538,8 @@ const ExcalidrawWrapper = () => {
+             const explorerFile = await explorerApi.getFile(storedFileId);
+             setActiveExplorerFile(explorerFile.meta);
+             explorerSceneRef.current = explorerFile.data;
++            explorerSavedSceneFingerprintRef.current = null;
++            explorerBaselinePendingRef.current = true;
+             explorerDirtyRef.current = false;
+             setExplorerSaveStatus("saved");
+             initialStatePromiseRef.current.promise.resolve(explorerFile.data);
+@@ -784,21 +796,43 @@ const ExcalidrawWrapper = () => {
+       !isCollaboratingRef.current &&
+       !suppressExplorerChangeRef.current
+     ) {
+-      explorerSceneRef.current = createExplorerScene(elements, appState, files);
+-      explorerDirtyRef.current = true;
+-      setExplorerSaveStatus("pending");
+-      if (explorerSaveTimerRef.current !== null) {
+-        window.clearTimeout(explorerSaveTimerRef.current);
++      const scene = createExplorerScene(elements, appState, files);
++      const sceneFingerprint = JSON.stringify(scene);
++      explorerSceneRef.current = scene;
++
++      if (explorerBaselinePendingRef.current) {
++        explorerBaselinePendingRef.current = false;
++        explorerSavedSceneFingerprintRef.current = sceneFingerprint;
++        explorerDirtyRef.current = false;
++        setExplorerSaveStatus("saved");
++      } else {
++        const hasUnsavedChanges =
++          explorerSaveInFlightRef.current !== null ||
++          sceneFingerprint !== explorerSavedSceneFingerprintRef.current;
++        explorerDirtyRef.current = hasUnsavedChanges;
++
++        if (hasUnsavedChanges) {
++          setExplorerSaveStatus("pending");
++          if (explorerSaveTimerRef.current !== null) {
++            window.clearTimeout(explorerSaveTimerRef.current);
++          }
++          explorerSaveTimerRef.current = window.setTimeout(() => {
++            explorerSaveTimerRef.current = null;
++            void saveExplorerScene();
++          }, 1500);
++        } else {
++          if (explorerSaveTimerRef.current !== null) {
++            window.clearTimeout(explorerSaveTimerRef.current);
++            explorerSaveTimerRef.current = null;
++          }
++          setExplorerSaveStatus("saved");
++        }
+       }
+-      explorerSaveTimerRef.current = window.setTimeout(() => {
+-        explorerSaveTimerRef.current = null;
+-        void saveExplorerScene();
+-      }, 1500);
+     }
+ 
+     // this check is redundant, but since this is a hot path, it's best
+     // not to evaludate the nested expression every time
+-    if (!LocalData.isSavePaused()) {
++    if (!activeExplorerFileIdRef.current && !LocalData.isSavePaused()) {
+       LocalData.save(elements, appState, files, () => {
+         if (excalidrawAPI) {
+           let didChange = false;
+@@ -848,6 +882,8 @@ const ExcalidrawWrapper = () => {
+         suppressExplorerChangeRef.current = true;
+         setActiveExplorerFile(explorerFile.meta);
+         explorerSceneRef.current = explorerFile.data;
++        explorerSavedSceneFingerprintRef.current = null;
++        explorerBaselinePendingRef.current = false;
+         explorerDirtyRef.current = false;
+         setExplorerSaveStatus("saved");
+ 
+@@ -865,6 +901,13 @@ const ExcalidrawWrapper = () => {
+         excalidrawAPI.history.clear();
+ 
+         window.requestAnimationFrame(() => {
++          const scene = createExplorerScene(
++            excalidrawAPI.getSceneElementsIncludingDeleted(),
++            excalidrawAPI.getAppState(),
++            excalidrawAPI.getFiles(),
++          );
++          explorerSceneRef.current = scene;
++          explorerSavedSceneFingerprintRef.current = JSON.stringify(scene);
+           suppressExplorerChangeRef.current = false;
+         });
+       } catch (caught) {
+diff --git a/excalidraw-app/components/explorer/ExplorerPanel.scss b/excalidraw-app/components/explorer/ExplorerPanel.scss
+index dea4eb8..02f716e 100644
+--- a/excalidraw-app/components/explorer/ExplorerPanel.scss
++++ b/excalidraw-app/components/explorer/ExplorerPanel.scss
+@@ -25,14 +25,23 @@
+ 
+   .ExplorerPanel {
+     position: absolute;
+-    z-index: 10;
+-    inset: 0 auto 0 0;
++    // 3 = über dem interaktiven Canvas, aber unter .layer-ui__wrapper
++    // (--zIndex-layerUI: 4), in dem das Hauptmenü-Dropdown lebt — so bleibt
++    // das Hauptmenü bei geöffnetem Panel bedienbar. Empirisch verifiziert:
++    // bei 1–2 fängt der Canvas die Panel-Klicks ab.
++    z-index: 3;
++    top: calc(
++      var(--editor-container-padding) + var(--sat, 0px) + var(--lg-button-size) +
++        0.75rem
++    );
++    bottom: 0;
++    left: 0;
+     display: flex;
+     flex-direction: column;
+     width: min(19rem, calc(100% - 1rem));
+     box-sizing: border-box;
+     border-right: 1px solid var(--sidebar-border-color);
+-    background: var(--color-surface-lowest);
++    background: var(--sidebar-bg-color);
+     color: var(--color-on-surface);
+     box-shadow: 0.25rem 0 1.25rem rgb(0 0 0 / 12%);
+   }
+@@ -43,7 +52,7 @@
+     justify-content: space-between;
+     gap: 0.75rem;
+     min-height: 4.35rem;
+-    padding: calc(0.85rem + var(--sat, 0px)) 0.8rem 0.75rem;
++    padding: 0.85rem 0.8rem 0.75rem;
+     box-sizing: border-box;
+     border-bottom: 1px solid var(--sidebar-border-color);
+ 
+@@ -270,7 +279,7 @@
+     padding: 0.3rem;
+     border: 1px solid var(--sidebar-border-color);
+     border-radius: var(--border-radius-lg);
+-    background: var(--color-surface-lowest);
++    background: var(--popup-bg-color);
+     box-shadow: 0 0.5rem 1.5rem rgb(0 0 0 / 18%);
+ 
+     button {
+diff --git a/excalidraw-app/components/explorer/ExplorerPanel.tsx b/excalidraw-app/components/explorer/ExplorerPanel.tsx
+index 93c6bf6..5f02d54 100644
+--- a/excalidraw-app/components/explorer/ExplorerPanel.tsx
++++ b/excalidraw-app/components/explorer/ExplorerPanel.tsx
+@@ -117,6 +117,37 @@ export const ExplorerPanel = ({
+     }
+   }, [error, hasLoadedProjects, isOpen, loadProjects, loadingProjects]);
+ 
++  useEffect(() => {
++    if (
++      !hasLoadedProjects ||
++      !activeProjectId ||
++      !projects.some((project) => project.id === activeProjectId)
++    ) {
++      return;
++    }
++
++    setExpandedProjects((current) => {
++      if (current.has(activeProjectId)) {
++        return current;
++      }
++      return new Set(current).add(activeProjectId);
++    });
++
++    if (
++      !Object.prototype.hasOwnProperty.call(filesByProject, activeProjectId) &&
++      !loadingFileProjects.has(activeProjectId)
++    ) {
++      void loadFiles(activeProjectId);
++    }
++  }, [
++    activeProjectId,
++    filesByProject,
++    hasLoadedProjects,
++    loadFiles,
++    loadingFileProjects,
++    projects,
++  ]);
++
+   useEffect(() => {
+     if (!contextMenu) {
+       return;
 -- 
 2.39.5 (Apple Git-154)
 
