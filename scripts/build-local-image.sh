@@ -13,7 +13,7 @@ TAG="${1:-excalidraw-complete:local-explorer}"
 }
 
 # Frontend-Artefakte in das go:embed-Verzeichnis spiegeln
-rsync -a --delete "$BUILD_DIR/" "$REPO_ROOT/frontend/"
+rsync -a --delete --exclude=.keep "$BUILD_DIR/" "$REPO_ROOT/frontend/"
 
 docker build -f "$REPO_ROOT/excalidraw-complete.Dockerfile" -t "$TAG" "$REPO_ROOT"
 echo "Image gebaut: $TAG"
