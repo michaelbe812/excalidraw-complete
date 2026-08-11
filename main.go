@@ -5,6 +5,7 @@ import (
 	_ "embed"
 	"excalidraw-complete/core"
 	"excalidraw-complete/handlers/api/documents"
+	explorerhandler "excalidraw-complete/handlers/api/explorer"
 	"excalidraw-complete/handlers/api/firebase"
 	"excalidraw-complete/stores"
 	"flag"
@@ -103,13 +104,13 @@ func handleUI() http.Handler {
 	})
 }
 
-func setupRouter(documentStore core.DocumentStore) *chi.Mux {
+func setupRouter(documentStore core.DocumentStore, explorerStore core.ExplorerStore) *chi.Mux {
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   []string{"https://*", "http://*"},
-		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "Content-Length", "X-CSRF-Token", "Token", "session", "Origin", "Host", "Connection", "Accept-Encoding", "Accept-Language", "X-Requested-With"},
 		AllowCredentials: true,
 		MaxAge:           300, // Maximum value not ignored by any of major browsers
@@ -126,6 +127,7 @@ func setupRouter(documentStore core.DocumentStore) *chi.Mux {
 			r.Get("/", documents.HandleGet(documentStore))
 		})
 	})
+	r.Route("/api/explorer", explorerhandler.Routes(explorerStore))
 	return r
 }
 func setupSocketIO() *socketio.Server {
@@ -144,7 +146,7 @@ func setupSocketIO() *socketio.Server {
 		me := socket.Id()
 		myRoom := socketio.Room(me)
 		ioo.To(myRoom).Emit("init-room")
-		utils.Log().Println("init room ", myRoom)
+		utils.Log().Printf("init room %v\n", myRoom)
 		socket.On("join-room", func(datas ...any) {
 			room := socketio.Room(datas[0].(string))
 			utils.Log().Printf("Socket %v has joined %v\n", me, room)
@@ -162,7 +164,7 @@ func setupSocketIO() *socketio.Server {
 				for _, user := range usersInRoom {
 					newRoomUsers = append(newRoomUsers, user.Id())
 				}
-				utils.Log().Println(" room ", room, " has users ", newRoomUsers)
+				utils.Log().Printf("room %v has users %v\n", room, newRoomUsers)
 				ioo.In(room).Emit(
 					"room-user-change",
 					newRoomUsers,
@@ -220,7 +222,7 @@ func setupSocketIO() *socketio.Server {
 
 func waitForShutdown(ioo *socketio.Server) {
 	exit := make(chan struct{})
-	SignalC := make(chan os.Signal)
+	SignalC := make(chan os.Signal, 1)
 
 	signal.Notify(SignalC, os.Interrupt, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 	go func() {
@@ -244,7 +246,7 @@ func waitForShutdown(ioo *socketio.Server) {
 func main() {
 	// Define a log level flag
 	logLevel := flag.String("loglevel", "info", "Set the logging level: debug, info, warn, error, fatal, panic")
-    listenAddr := flag.String("listen", ":3002", "Set the server listen address")
+	listenAddr := flag.String("listen", ":3002", "Set the server listen address")
 	flag.Parse()
 
 	// Set the log level
@@ -256,7 +258,8 @@ func main() {
 	logrus.SetLevel(level)
 
 	documentStore := stores.GetStore() // Make sure this is well-defined in your "stores" package
-	r := setupRouter(documentStore)
+	explorerStore := stores.GetExplorerStore()
+	r := setupRouter(documentStore, explorerStore)
 	ioo := setupSocketIO()
 	r.Handle("/socket.io/", ioo.ServeHandler(nil))
 	r.Get("/ping", func(w http.ResponseWriter, _ *http.Request) {

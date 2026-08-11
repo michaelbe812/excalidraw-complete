@@ -3,10 +3,12 @@ package stores
 import (
 	"excalidraw-complete/core"
 	"excalidraw-complete/stores/aws"
+	explorerstore "excalidraw-complete/stores/explorer"
 	"excalidraw-complete/stores/filesystem"
 	"excalidraw-complete/stores/memory"
 	"excalidraw-complete/stores/sqlite"
 	"os"
+	"path/filepath"
 
 	"github.com/sirupsen/logrus"
 )
@@ -38,4 +40,19 @@ func GetStore() core.DocumentStore {
 	}
 	logrus.WithFields(storageField).Info("Use storage")
 	return store
+}
+
+func GetExplorerStore() core.ExplorerStore {
+	basePath := os.Getenv("EXPLORER_STORAGE_PATH")
+	if basePath == "" {
+		localStoragePath := os.Getenv("LOCAL_STORAGE_PATH")
+		if localStoragePath != "" {
+			basePath = filepath.Join(localStoragePath, "explorer")
+		} else {
+			basePath = filepath.Join(".", "data", "explorer")
+		}
+	}
+
+	logrus.WithField("basePath", basePath).Info("Use explorer storage")
+	return explorerstore.NewFilesystemStore(basePath)
 }

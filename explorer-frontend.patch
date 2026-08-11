@@ -1,0 +1,1498 @@
+From 1f58045a06d272c9a824b7b46a2589fe93d577e0 Mon Sep 17 00:00:00 2001
+From: Michael Be <m.gonser@icloud.com>
+Date: Tue, 11 Aug 2026 12:09:55 +0200
+Subject: [PATCH] feat: add project & file explorer panel
+ (Excalidraw-Plus-style)
+
+Left-docked Files panel with project/file tree backed by /api/explorer:
+create/rename/delete/move, click-to-open with pre-switch flush, debounced
+autosave (1.5s) with keepalive flush on unload, disabled during collab.
+Active file persisted in localStorage and restored on startup.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ excalidraw-app/App.tsx                        | 303 ++++++++-
+ .../components/explorer/ExplorerPanel.scss    | 325 ++++++++++
+ .../components/explorer/ExplorerPanel.tsx     | 580 ++++++++++++++++++
+ excalidraw-app/data/explorer.ts               | 170 +++++
+ 4 files changed, 1373 insertions(+), 5 deletions(-)
+ create mode 100644 excalidraw-app/components/explorer/ExplorerPanel.scss
+ create mode 100644 excalidraw-app/components/explorer/ExplorerPanel.tsx
+ create mode 100644 excalidraw-app/data/explorer.ts
+
+diff --git a/excalidraw-app/App.tsx b/excalidraw-app/App.tsx
+index 7035996..9024cb9 100644
+--- a/excalidraw-app/App.tsx
++++ b/excalidraw-app/App.tsx
+@@ -107,6 +107,18 @@ import { OverwriteConfirmDialog } from "../packages/excalidraw/components/Overwr
+ import Trans from "../packages/excalidraw/components/Trans";
+ import { ShareDialog, shareDialogStateAtom } from "./share/ShareDialog";
+ import CollabError, { collabErrorIndicatorAtom } from "./collab/CollabError";
++import {
++  EXPLORER_CURRENT_FILE_KEY,
++  ExplorerFileMeta,
++  ExplorerScene,
++  createExplorerScene,
++  explorerApi,
++  getExplorerErrorMessage,
++} from "./data/explorer";
++import {
++  ExplorerPanel,
++  ExplorerSaveStatus,
++} from "./components/explorer/ExplorerPanel";
+ 
+ polyfill();
+ 
+@@ -315,6 +327,110 @@ const ExcalidrawWrapper = () => {
+   });
+   const collabError = useAtomValue(collabErrorIndicatorAtom);
+ 
++  const [activeExplorerFileId, setActiveExplorerFileId] = useState<
++    string | null
++  >(() => localStorage.getItem(EXPLORER_CURRENT_FILE_KEY));
++  const [activeExplorerFile, setActiveExplorerFileState] =
++    useState<ExplorerFileMeta | null>(null);
++  const [explorerSaveStatus, setExplorerSaveStatus] =
++    useState<ExplorerSaveStatus>(activeExplorerFileId ? "saved" : "idle");
++  const activeExplorerFileIdRef = useRef(activeExplorerFileId);
++  const explorerSceneRef = useRef<ExplorerScene | null>(null);
++  const explorerSaveTimerRef = useRef<number | null>(null);
++  const explorerDirtyRef = useRef(false);
++  const explorerSaveInFlightRef = useRef<Promise<boolean> | null>(null);
++  const suppressExplorerChangeRef = useRef(false);
++  const isCollaboratingRef = useRef(isCollaborating);
++  const initialExplorerLoadRef = useRef(false);
++
++  isCollaboratingRef.current = isCollaborating;
++
++  const setActiveExplorerFile = useCallback((file: ExplorerFileMeta | null) => {
++    const fileId = file?.id || null;
++    activeExplorerFileIdRef.current = fileId;
++    setActiveExplorerFileId(fileId);
++    setActiveExplorerFileState(file);
++    if (fileId) {
++      localStorage.setItem(EXPLORER_CURRENT_FILE_KEY, fileId);
++    } else {
++      localStorage.removeItem(EXPLORER_CURRENT_FILE_KEY);
++    }
++  }, []);
++
++  const showExplorerError = useCallback(
++    (message: string) => {
++      excalidrawAPI?.setToast({ message });
++    },
++    [excalidrawAPI],
++  );
++
++  const saveExplorerScene = useCallback(async () => {
++    if (isCollaboratingRef.current) {
++      return true;
++    }
++    if (explorerSaveInFlightRef.current) {
++      await explorerSaveInFlightRef.current;
++    }
++
++    const fileId = activeExplorerFileIdRef.current;
++    const scene = explorerSceneRef.current;
++    if (!fileId || !scene || !explorerDirtyRef.current) {
++      return true;
++    }
++
++    setExplorerSaveStatus("saving");
++    const savePromise = explorerApi
++      .updateFile(fileId, { data: scene })
++      .then((updated) => {
++        if (
++          activeExplorerFileIdRef.current === fileId &&
++          explorerSceneRef.current === scene
++        ) {
++          explorerDirtyRef.current = false;
++          setExplorerSaveStatus("saved");
++          setActiveExplorerFileState(updated);
++        }
++        return true;
++      })
++      .catch((caught: unknown) => {
++        if (activeExplorerFileIdRef.current === fileId) {
++          setExplorerSaveStatus("error");
++        }
++        showExplorerError(
++          `Zeichnung konnte nicht gespeichert werden: ${getExplorerErrorMessage(
++            caught,
++          )}`,
++        );
++        return false;
++      });
++
++    explorerSaveInFlightRef.current = savePromise;
++    const didSave = await savePromise;
++    if (explorerSaveInFlightRef.current === savePromise) {
++      explorerSaveInFlightRef.current = null;
++    }
++    return didSave;
++  }, [showExplorerError]);
++
++  const flushExplorerSave = useCallback(async () => {
++    if (explorerSaveTimerRef.current !== null) {
++      window.clearTimeout(explorerSaveTimerRef.current);
++      explorerSaveTimerRef.current = null;
++    }
++    return saveExplorerScene();
++  }, [saveExplorerScene]);
++
++  const clearActiveExplorerFile = useCallback(() => {
++    if (explorerSaveTimerRef.current !== null) {
++      window.clearTimeout(explorerSaveTimerRef.current);
++      explorerSaveTimerRef.current = null;
++    }
++    explorerDirtyRef.current = false;
++    explorerSceneRef.current = null;
++    setActiveExplorerFile(null);
++    setExplorerSaveStatus("idle");
++  }, [setActiveExplorerFile]);
++
+   useHandleLibrary({
+     excalidrawAPI,
+     adapter: LibraryIndexedDBAdapter,
+@@ -394,15 +510,56 @@ const ExcalidrawWrapper = () => {
+       }
+     };
+ 
+-    initializeScene({ collabAPI, excalidrawAPI }).then(async (data) => {
+-      loadImages(data, /* isInitialLoad */ true);
+-      initialStatePromiseRef.current.promise.resolve(data.scene);
+-    });
++    if (!initialExplorerLoadRef.current) {
++      initialExplorerLoadRef.current = true;
++      const initializeAppScene = async () => {
++        const storedFileId = activeExplorerFileIdRef.current;
++        const hasExternalScene =
++          new URLSearchParams(window.location.search).has("id") ||
++          /^#(?:json=|url=)/.test(window.location.hash) ||
++          isCollaborationLink(window.location.href);
++
++        if (storedFileId && hasExternalScene) {
++          clearActiveExplorerFile();
++        }
++
++        if (storedFileId && !hasExternalScene) {
++          try {
++            const explorerFile = await explorerApi.getFile(storedFileId);
++            setActiveExplorerFile(explorerFile.meta);
++            explorerSceneRef.current = explorerFile.data;
++            explorerDirtyRef.current = false;
++            setExplorerSaveStatus("saved");
++            initialStatePromiseRef.current.promise.resolve(explorerFile.data);
++            return;
++          } catch (caught) {
++            clearActiveExplorerFile();
++            showExplorerError(
++              `Gespeicherte Explorer-Datei konnte nicht geöffnet werden: ${getExplorerErrorMessage(
++                caught,
++              )}`,
++            );
++          }
++        }
++
++        const data = await initializeScene({ collabAPI, excalidrawAPI });
++        loadImages(data, /* isInitialLoad */ true);
++        initialStatePromiseRef.current.promise.resolve(data.scene);
++      };
++
++      void initializeAppScene();
++    }
+ 
+     const onHashChange = async (event: HashChangeEvent) => {
+       event.preventDefault();
+       const libraryUrlTokens = parseLibraryTokensFromUrl();
+       if (!libraryUrlTokens) {
++        if (activeExplorerFileIdRef.current) {
++          if (!(await flushExplorerSave())) {
++            return;
++          }
++          clearActiveExplorerFile();
++        }
+         if (
+           collabAPI?.isCollaborating() &&
+           !isCollaborationLink(window.location.href)
+@@ -435,6 +592,7 @@ const ExcalidrawWrapper = () => {
+       }
+       if (
+         !document.hidden &&
++        !activeExplorerFileIdRef.current &&
+         ((collabAPI && !collabAPI.isCollaborating()) || isCollabDisabled)
+       ) {
+         // don't sync if local state is newer or identical to browser state
+@@ -524,12 +682,44 @@ const ExcalidrawWrapper = () => {
+       );
+       clearTimeout(titleTimeout);
+     };
+-  }, [isCollabDisabled, collabAPI, excalidrawAPI, setLangCode]);
++  }, [
++    clearActiveExplorerFile,
++    collabAPI,
++    excalidrawAPI,
++    flushExplorerSave,
++    isCollabDisabled,
++    setActiveExplorerFile,
++    setLangCode,
++    showExplorerError,
++  ]);
+ 
+   useEffect(() => {
+     const unloadHandler = (event: BeforeUnloadEvent) => {
+       LocalData.flushSave();
+ 
++      const explorerFileId = activeExplorerFileIdRef.current;
++      const explorerScene = explorerSceneRef.current;
++      if (
++        explorerFileId &&
++        explorerScene &&
++        explorerDirtyRef.current &&
++        !isCollaboratingRef.current
++      ) {
++        // sendBeacon cannot issue the PUT required by the API contract. A
++        // keepalive request is the browser-supported unload-safe alternative.
++        void fetch(
++          `/api/explorer/files/${encodeURIComponent(explorerFileId)}`,
++          {
++            method: "PUT",
++            headers: { "Content-Type": "application/json" },
++            body: JSON.stringify({ data: explorerScene }),
++            keepalive: true,
++          },
++        ).catch(() => {
++          // The page is unloading, so there is no useful UI to update here.
++        });
++      }
++
+       if (
+         excalidrawAPI &&
+         LocalData.fileStorage.shouldPreventUnload(
+@@ -545,6 +735,18 @@ const ExcalidrawWrapper = () => {
+     };
+   }, [excalidrawAPI]);
+ 
++  useEffect(() => {
++    if (isCollaborating) {
++      if (explorerSaveTimerRef.current !== null) {
++        window.clearTimeout(explorerSaveTimerRef.current);
++        explorerSaveTimerRef.current = null;
++      }
++      explorerDirtyRef.current = false;
++    } else if (activeExplorerFileIdRef.current) {
++      setExplorerSaveStatus("saved");
++    }
++  }, [isCollaborating]);
++
+   useEffect(() => {
+     languageDetector.cacheUserLanguage(langCode);
+   }, [langCode]);
+@@ -577,6 +779,23 @@ const ExcalidrawWrapper = () => {
+ 
+     setTheme(appState.theme);
+ 
++    if (
++      activeExplorerFileIdRef.current &&
++      !isCollaboratingRef.current &&
++      !suppressExplorerChangeRef.current
++    ) {
++      explorerSceneRef.current = createExplorerScene(elements, appState, files);
++      explorerDirtyRef.current = true;
++      setExplorerSaveStatus("pending");
++      if (explorerSaveTimerRef.current !== null) {
++        window.clearTimeout(explorerSaveTimerRef.current);
++      }
++      explorerSaveTimerRef.current = window.setTimeout(() => {
++        explorerSaveTimerRef.current = null;
++        void saveExplorerScene();
++      }, 1500);
++    }
++
+     // this check is redundant, but since this is a hot path, it's best
+     // not to evaludate the nested expression every time
+     if (!LocalData.isSavePaused()) {
+@@ -609,6 +828,70 @@ const ExcalidrawWrapper = () => {
+     }
+   };
+ 
++  const openExplorerFile = useCallback(
++    async (fileId: string) => {
++      if (!excalidrawAPI || fileId === activeExplorerFileIdRef.current) {
++        return;
++      }
++
++      try {
++        const explorerFile = await explorerApi.getFile(fileId);
++        if (!(await flushExplorerSave())) {
++          return;
++        }
++
++        const currentAppState = excalidrawAPI.getAppState();
++        const restored = restore(explorerFile.data, currentAppState, null, {
++          repairBindings: true,
++        });
++
++        suppressExplorerChangeRef.current = true;
++        setActiveExplorerFile(explorerFile.meta);
++        explorerSceneRef.current = explorerFile.data;
++        explorerDirtyRef.current = false;
++        setExplorerSaveStatus("saved");
++
++        excalidrawAPI.resetScene({ resetLoadingState: true });
++        excalidrawAPI.updateScene({
++          elements: restored.elements,
++          appState: {
++            ...restored.appState,
++            theme: currentAppState.theme,
++            isLoading: false,
++          },
++          commitToHistory: true,
++        });
++        excalidrawAPI.addFiles(Object.values(restored.files));
++        excalidrawAPI.history.clear();
++
++        window.requestAnimationFrame(() => {
++          suppressExplorerChangeRef.current = false;
++        });
++      } catch (caught) {
++        suppressExplorerChangeRef.current = false;
++        showExplorerError(
++          `Zeichnung konnte nicht geöffnet werden: ${getExplorerErrorMessage(
++            caught,
++          )}`,
++        );
++      }
++    },
++    [
++      excalidrawAPI,
++      flushExplorerSave,
++      setActiveExplorerFile,
++      showExplorerError,
++    ],
++  );
++
++  useEffect(() => {
++    return () => {
++      if (explorerSaveTimerRef.current !== null) {
++        window.clearTimeout(explorerSaveTimerRef.current);
++      }
++    };
++  }, []);
++
+   const [latestShareableLink, setLatestShareableLink] = useState<string | null>(
+     null,
+   );
+@@ -760,6 +1043,16 @@ const ExcalidrawWrapper = () => {
+           );
+         }}
+       >
++        <ExplorerPanel
++          activeFileId={activeExplorerFileId}
++          activeProjectId={activeExplorerFile?.projectId || null}
++          isCollaborating={isCollaborating}
++          saveStatus={explorerSaveStatus}
++          onOpenFile={openExplorerFile}
++          onActiveFileDeleted={clearActiveExplorerFile}
++          onActiveFileMetaChange={setActiveExplorerFile}
++          onError={showExplorerError}
++        />
+         <AppMainMenu
+           onCollabDialogOpen={onCollabDialogOpen}
+           isCollaborating={isCollaborating}
+diff --git a/excalidraw-app/components/explorer/ExplorerPanel.scss b/excalidraw-app/components/explorer/ExplorerPanel.scss
+new file mode 100644
+index 0000000..dea4eb8
+--- /dev/null
++++ b/excalidraw-app/components/explorer/ExplorerPanel.scss
+@@ -0,0 +1,325 @@
++.excalidraw {
++  .ExplorerToggle {
++    position: absolute;
++    z-index: 5;
++    top: calc(var(--editor-container-padding) + var(--sat, 0px));
++    left: calc(var(--editor-container-padding) + 3.25rem);
++    display: flex;
++    align-items: center;
++    gap: 0.4rem;
++    height: var(--lg-button-size);
++    padding: 0 0.7rem;
++    border: 0;
++    border-radius: var(--border-radius-lg);
++    box-shadow: 0 0 0 1px var(--color-surface-lowest);
++    background: var(--color-surface-mid);
++    color: var(--color-on-surface);
++    font: inherit;
++    font-size: 0.75rem;
++    font-weight: 600;
++
++    &:hover {
++      background: var(--color-surface-high);
++    }
++  }
++
++  .ExplorerPanel {
++    position: absolute;
++    z-index: 10;
++    inset: 0 auto 0 0;
++    display: flex;
++    flex-direction: column;
++    width: min(19rem, calc(100% - 1rem));
++    box-sizing: border-box;
++    border-right: 1px solid var(--sidebar-border-color);
++    background: var(--color-surface-lowest);
++    color: var(--color-on-surface);
++    box-shadow: 0.25rem 0 1.25rem rgb(0 0 0 / 12%);
++  }
++
++  .ExplorerPanel__header {
++    display: flex;
++    align-items: flex-start;
++    justify-content: space-between;
++    gap: 0.75rem;
++    min-height: 4.35rem;
++    padding: calc(0.85rem + var(--sat, 0px)) 0.8rem 0.75rem;
++    box-sizing: border-box;
++    border-bottom: 1px solid var(--sidebar-border-color);
++
++    h2 {
++      margin: 0 0 0.3rem;
++      font-size: 1rem;
++      line-height: 1.25;
++    }
++  }
++
++  .ExplorerPanel__headerActions {
++    display: flex;
++    gap: 0.25rem;
++
++    button {
++      width: 2rem;
++      height: 2rem;
++      padding: 0;
++      border: 0;
++      border-radius: var(--border-radius-md);
++      background: transparent;
++      color: var(--color-on-surface);
++      font-size: 1.25rem;
++
++      &:hover {
++        background: var(--color-surface-high);
++      }
++    }
++  }
++
++  .ExplorerPanel__saveStatus {
++    display: flex;
++    align-items: center;
++    gap: 0.35rem;
++    color: var(--color-muted-darker);
++    font-size: 0.68rem;
++    line-height: 1.25;
++  }
++
++  .ExplorerPanel__statusDot {
++    flex: 0 0 auto;
++    width: 0.4rem;
++    height: 0.4rem;
++    border-radius: 50%;
++    background: var(--color-success);
++
++    &.is-saving {
++      background: var(--color-primary);
++      animation: explorer-pulse 0.9s ease-in-out infinite alternate;
++    }
++
++    &.is-error {
++      background: var(--color-danger);
++    }
++
++    &.is-disabled {
++      background: var(--color-muted-darker);
++    }
++  }
++
++  .ExplorerPanel__tree {
++    flex: 1 1 auto;
++    min-height: 0;
++    overflow: auto;
++    padding: 0.45rem;
++  }
++
++  .ExplorerPanel__project {
++    margin-bottom: 0.2rem;
++  }
++
++  .ExplorerPanel__row {
++    display: flex;
++    align-items: center;
++    min-width: 0;
++    border-radius: var(--border-radius-md);
++
++    &:hover {
++      background: var(--color-surface-high);
++
++      .ExplorerPanel__more {
++        opacity: 1;
++      }
++    }
++
++    &.active {
++      background: var(--color-surface-primary-container);
++      color: var(--color-on-primary-container);
++    }
++  }
++
++  .ExplorerPanel__projectRow {
++    font-weight: 600;
++  }
++
++  .ExplorerPanel__fileRow {
++    padding-left: 1.35rem;
++  }
++
++  .ExplorerPanel__rowMain {
++    display: flex;
++    flex: 1 1 auto;
++    align-items: center;
++    gap: 0.45rem;
++    min-width: 0;
++    height: 2rem;
++    padding: 0 0.35rem;
++    border: 0;
++    background: transparent;
++    color: inherit;
++    font: inherit;
++    text-align: left;
++  }
++
++  .ExplorerPanel__chevron {
++    width: 0.65rem;
++    color: var(--color-muted-darker);
++    text-align: center;
++  }
++
++  .ExplorerPanel__name {
++    overflow: hidden;
++    text-overflow: ellipsis;
++    white-space: nowrap;
++  }
++
++  .ExplorerPanel__more {
++    flex: 0 0 auto;
++    width: 1.8rem;
++    height: 1.8rem;
++    padding: 0;
++    border: 0;
++    border-radius: var(--border-radius-md);
++    opacity: 0;
++    background: transparent;
++    color: inherit;
++    font-size: 1rem;
++
++    &:focus-visible {
++      opacity: 1;
++    }
++
++    &:hover {
++      background: var(--color-surface-low);
++    }
++  }
++
++  .ExplorerPanel__newFile {
++    width: calc(100% - 1.35rem);
++    margin-left: 1.35rem;
++    padding: 0.45rem 0.55rem;
++    border: 0;
++    border-radius: var(--border-radius-md);
++    background: transparent;
++    color: var(--color-primary);
++    font: inherit;
++    font-size: 0.75rem;
++    text-align: left;
++
++    &:hover {
++      background: var(--color-surface-high);
++    }
++  }
++
++  .ExplorerPanel__message,
++  .ExplorerPanel__empty {
++    padding: 1rem 0.75rem;
++    color: var(--color-muted-darker);
++    font-size: 0.75rem;
++    line-height: 1.45;
++  }
++
++  .ExplorerPanel__empty {
++    padding-top: 2rem;
++    text-align: center;
++
++    p {
++      margin: 0 0 1rem;
++    }
++
++    button {
++      padding: 0.55rem 0.8rem;
++      border: 0;
++      border-radius: var(--border-radius-md);
++      background: var(--color-primary);
++      color: var(--color-surface-lowest);
++      font: inherit;
++      font-weight: 600;
++    }
++  }
++
++  .ExplorerPanel__error {
++    display: flex;
++    flex-direction: column;
++    gap: 0.45rem;
++    margin: 0.5rem;
++    padding: 0.65rem;
++    border-radius: var(--border-radius-md);
++    background: var(--color-danger-background);
++    color: var(--color-danger-color);
++    font-size: 0.72rem;
++    line-height: 1.35;
++
++    button {
++      align-self: flex-start;
++      padding: 0;
++      border: 0;
++      background: transparent;
++      color: inherit;
++      font: inherit;
++      font-weight: 600;
++      text-decoration: underline;
++    }
++  }
++
++  .ExplorerContextMenu {
++    position: fixed;
++    z-index: var(--zIndex-popup);
++    display: flex;
++    flex-direction: column;
++    width: min(13rem, calc(100vw - 1rem));
++    max-height: calc(100vh - 1rem);
++    overflow: auto;
++    padding: 0.3rem;
++    border: 1px solid var(--sidebar-border-color);
++    border-radius: var(--border-radius-lg);
++    background: var(--color-surface-lowest);
++    box-shadow: 0 0.5rem 1.5rem rgb(0 0 0 / 18%);
++
++    button {
++      min-height: 2rem;
++      padding: 0.4rem 0.55rem;
++      border: 0;
++      border-radius: var(--border-radius-md);
++      background: transparent;
++      color: var(--color-on-surface);
++      font: inherit;
++      font-size: 0.78rem;
++      text-align: left;
++
++      &:hover {
++        background: var(--color-surface-high);
++      }
++
++      &.danger {
++        color: var(--color-danger);
++      }
++    }
++  }
++
++  .ExplorerContextMenu__move {
++    display: flex;
++    flex-direction: column;
++    padding: 0.25rem 0;
++    border-top: 1px solid var(--sidebar-border-color);
++    border-bottom: 1px solid var(--sidebar-border-color);
++
++    > span {
++      padding: 0.35rem 0.55rem 0.2rem;
++      color: var(--color-muted-darker);
++      font-size: 0.65rem;
++      font-weight: 600;
++      text-transform: uppercase;
++    }
++
++    button {
++      padding-left: 1rem;
++    }
++  }
++}
++
++@keyframes explorer-pulse {
++  from {
++    opacity: 0.4;
++  }
++  to {
++    opacity: 1;
++  }
++}
+diff --git a/excalidraw-app/components/explorer/ExplorerPanel.tsx b/excalidraw-app/components/explorer/ExplorerPanel.tsx
+new file mode 100644
+index 0000000..93c6bf6
+--- /dev/null
++++ b/excalidraw-app/components/explorer/ExplorerPanel.tsx
+@@ -0,0 +1,580 @@
++import React, { useCallback, useEffect, useState } from "react";
++import clsx from "clsx";
++
++import {
++  EXPLORER_PANEL_OPEN_KEY,
++  ExplorerFileMeta,
++  ExplorerProject,
++  explorerApi,
++  getExplorerErrorMessage,
++} from "../../data/explorer";
++
++import "./ExplorerPanel.scss";
++
++export type ExplorerSaveStatus =
++  | "idle"
++  | "pending"
++  | "saving"
++  | "saved"
++  | "error";
++
++type ContextMenuState =
++  | { kind: "project"; project: ExplorerProject; x: number; y: number }
++  | { kind: "file"; file: ExplorerFileMeta; x: number; y: number };
++
++type ExplorerPanelProps = {
++  activeFileId: string | null;
++  activeProjectId: string | null;
++  isCollaborating: boolean;
++  saveStatus: ExplorerSaveStatus;
++  onOpenFile: (fileId: string) => Promise<void>;
++  onActiveFileDeleted: () => void;
++  onActiveFileMetaChange: (file: ExplorerFileMeta) => void;
++  onError: (message: string) => void;
++};
++
++const sortByName = <T extends { name: string }>(items: T[]) =>
++  [...items].sort((a, b) => a.name.localeCompare(b.name));
++
++const getPromptName = (label: string, currentName = "") => {
++  const value = window.prompt(label, currentName);
++  return value?.trim() || null;
++};
++
++export const ExplorerPanel = ({
++  activeFileId,
++  activeProjectId,
++  isCollaborating,
++  saveStatus,
++  onOpenFile,
++  onActiveFileDeleted,
++  onActiveFileMetaChange,
++  onError,
++}: ExplorerPanelProps) => {
++  const [isOpen, setIsOpen] = useState(
++    () => localStorage.getItem(EXPLORER_PANEL_OPEN_KEY) === "true",
++  );
++  const [projects, setProjects] = useState<ExplorerProject[]>([]);
++  const [filesByProject, setFilesByProject] = useState<
++    Record<string, ExplorerFileMeta[]>
++  >({});
++  const [expandedProjects, setExpandedProjects] = useState<Set<string>>(
++    new Set(),
++  );
++  const [loadingProjects, setLoadingProjects] = useState(false);
++  const [hasLoadedProjects, setHasLoadedProjects] = useState(false);
++  const [loadingFileProjects, setLoadingFileProjects] = useState<Set<string>>(
++    new Set(),
++  );
++  const [error, setError] = useState<string | null>(null);
++  const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
++
++  const reportError = useCallback(
++    (caught: unknown) => {
++      const message = getExplorerErrorMessage(caught);
++      setError(message);
++      onError(message);
++    },
++    [onError],
++  );
++
++  const loadProjects = useCallback(async () => {
++    setLoadingProjects(true);
++    setError(null);
++    try {
++      setProjects(await explorerApi.getProjects());
++      setHasLoadedProjects(true);
++    } catch (caught) {
++      reportError(caught);
++    } finally {
++      setLoadingProjects(false);
++    }
++  }, [reportError]);
++
++  const loadFiles = useCallback(
++    async (projectId: string) => {
++      setLoadingFileProjects((current) => new Set(current).add(projectId));
++      try {
++        const files = await explorerApi.getFiles(projectId);
++        setFilesByProject((current) => ({ ...current, [projectId]: files }));
++      } catch (caught) {
++        reportError(caught);
++      } finally {
++        setLoadingFileProjects((current) => {
++          const next = new Set(current);
++          next.delete(projectId);
++          return next;
++        });
++      }
++    },
++    [reportError],
++  );
++
++  useEffect(() => {
++    localStorage.setItem(EXPLORER_PANEL_OPEN_KEY, String(isOpen));
++    if (isOpen && !loadingProjects && !hasLoadedProjects && !error) {
++      void loadProjects();
++    }
++  }, [error, hasLoadedProjects, isOpen, loadProjects, loadingProjects]);
++
++  useEffect(() => {
++    if (!contextMenu) {
++      return;
++    }
++    const close = () => setContextMenu(null);
++    const closeOnEscape = (event: KeyboardEvent) => {
++      if (event.key === "Escape") {
++        close();
++      }
++    };
++    window.addEventListener("pointerdown", close);
++    window.addEventListener("keydown", closeOnEscape);
++    return () => {
++      window.removeEventListener("pointerdown", close);
++      window.removeEventListener("keydown", closeOnEscape);
++    };
++  }, [contextMenu]);
++
++  const createProject = async () => {
++    setContextMenu(null);
++    const name = getPromptName("Name des neuen Projekts");
++    if (!name) {
++      return;
++    }
++    try {
++      const project = await explorerApi.createProject(name);
++      setProjects((current) => sortByName([...current, project]));
++      setFilesByProject((current) => ({ ...current, [project.id]: [] }));
++      setExpandedProjects((current) => new Set(current).add(project.id));
++      setError(null);
++    } catch (caught) {
++      reportError(caught);
++    }
++  };
++
++  const renameProject = async (project: ExplorerProject) => {
++    setContextMenu(null);
++    const name = getPromptName("Projekt umbenennen", project.name);
++    if (!name || name === project.name) {
++      return;
++    }
++    try {
++      const updated = await explorerApi.renameProject(project.id, name);
++      setProjects((current) =>
++        sortByName(
++          current.map((item) => (item.id === updated.id ? updated : item)),
++        ),
++      );
++    } catch (caught) {
++      reportError(caught);
++    }
++  };
++
++  const deleteProject = async (project: ExplorerProject) => {
++    setContextMenu(null);
++    if (
++      !window.confirm(
++        `Projekt „${project.name}“ wirklich löschen? Alle enthaltenen Dateien werden ebenfalls gelöscht.`,
++      )
++    ) {
++      return;
++    }
++    try {
++      await explorerApi.deleteProject(project.id);
++      setProjects((current) =>
++        current.filter((item) => item.id !== project.id),
++      );
++      setFilesByProject((current) => {
++        const next = { ...current };
++        delete next[project.id];
++        return next;
++      });
++      if (activeProjectId === project.id) {
++        onActiveFileDeleted();
++      }
++    } catch (caught) {
++      reportError(caught);
++    }
++  };
++
++  const createFile = async (project: ExplorerProject) => {
++    setContextMenu(null);
++    const name = getPromptName("Name der neuen Zeichnung");
++    if (!name) {
++      return;
++    }
++    try {
++      const file = await explorerApi.createFile(project.id, name);
++      setFilesByProject((current) => ({
++        ...current,
++        [project.id]: sortByName([...(current[project.id] || []), file]),
++      }));
++      setExpandedProjects((current) => new Set(current).add(project.id));
++      await onOpenFile(file.id);
++    } catch (caught) {
++      reportError(caught);
++    }
++  };
++
++  const renameFile = async (file: ExplorerFileMeta) => {
++    setContextMenu(null);
++    const name = getPromptName("Zeichnung umbenennen", file.name);
++    if (!name || name === file.name) {
++      return;
++    }
++    try {
++      const updated = await explorerApi.updateFile(file.id, { name });
++      setFilesByProject((current) => ({
++        ...current,
++        [file.projectId]: sortByName(
++          (current[file.projectId] || []).map((item) =>
++            item.id === updated.id ? updated : item,
++          ),
++        ),
++      }));
++      if (activeFileId === file.id) {
++        onActiveFileMetaChange(updated);
++      }
++    } catch (caught) {
++      reportError(caught);
++    }
++  };
++
++  const deleteFile = async (file: ExplorerFileMeta) => {
++    setContextMenu(null);
++    if (!window.confirm(`Zeichnung „${file.name}“ wirklich löschen?`)) {
++      return;
++    }
++    try {
++      await explorerApi.deleteFile(file.id);
++      setFilesByProject((current) => ({
++        ...current,
++        [file.projectId]: (current[file.projectId] || []).filter(
++          (item) => item.id !== file.id,
++        ),
++      }));
++      if (activeFileId === file.id) {
++        onActiveFileDeleted();
++      }
++    } catch (caught) {
++      reportError(caught);
++    }
++  };
++
++  const moveFile = async (file: ExplorerFileMeta, projectId: string) => {
++    setContextMenu(null);
++    try {
++      const updated = await explorerApi.updateFile(file.id, { projectId });
++      setFilesByProject((current) => ({
++        ...current,
++        [file.projectId]: (current[file.projectId] || []).filter(
++          (item) => item.id !== file.id,
++        ),
++      }));
++      setExpandedProjects((current) => new Set(current).add(projectId));
++      await loadFiles(projectId);
++      if (activeFileId === file.id) {
++        onActiveFileMetaChange(updated);
++      }
++    } catch (caught) {
++      reportError(caught);
++    }
++  };
++
++  const toggleProject = (projectId: string) => {
++    const isExpanded = expandedProjects.has(projectId);
++    setExpandedProjects((current) => {
++      const next = new Set(current);
++      isExpanded ? next.delete(projectId) : next.add(projectId);
++      return next;
++    });
++    if (!isExpanded && !filesByProject[projectId]) {
++      void loadFiles(projectId);
++    }
++  };
++
++  const openContextMenu = (
++    event: React.MouseEvent,
++    target:
++      | { kind: "project"; project: ExplorerProject }
++      | { kind: "file"; file: ExplorerFileMeta },
++  ) => {
++    event.preventDefault();
++    event.stopPropagation();
++    setContextMenu({ ...target, x: event.clientX, y: event.clientY });
++  };
++
++  const saveLabel = isCollaborating
++    ? "Autosave während Zusammenarbeit deaktiviert"
++    : saveStatus === "saving"
++    ? "Speichert…"
++    : saveStatus === "pending"
++    ? "Änderungen ausstehend"
++    : saveStatus === "error"
++    ? "Speichern fehlgeschlagen"
++    : saveStatus === "saved"
++    ? "Gespeichert"
++    : "Keine Datei geöffnet";
++
++  return (
++    <>
++      {!isOpen && (
++        <button
++          className="ExplorerToggle"
++          type="button"
++          title="Files öffnen"
++          aria-label="Files öffnen"
++          onClick={() => setIsOpen(true)}
++        >
++          <span aria-hidden="true">☰</span>
++          <span>Files</span>
++        </button>
++      )}
++
++      {isOpen && (
++        <aside className="ExplorerPanel" aria-label="Files Explorer">
++          <header className="ExplorerPanel__header">
++            <div>
++              <h2>Files</h2>
++              <div className="ExplorerPanel__saveStatus" role="status">
++                <span
++                  className={clsx("ExplorerPanel__statusDot", {
++                    "is-saving": saveStatus === "saving",
++                    "is-error": saveStatus === "error",
++                    "is-disabled": isCollaborating,
++                  })}
++                />
++                {saveLabel}
++              </div>
++            </div>
++            <div className="ExplorerPanel__headerActions">
++              <button
++                type="button"
++                title="Neues Projekt"
++                onClick={createProject}
++              >
++                +
++              </button>
++              <button
++                type="button"
++                title="Files schließen"
++                aria-label="Files schließen"
++                onClick={() => setIsOpen(false)}
++              >
++                ×
++              </button>
++            </div>
++          </header>
++
++          {error && (
++            <div className="ExplorerPanel__error">
++              <span>{error}</span>
++              <button type="button" onClick={loadProjects}>
++                Erneut versuchen
++              </button>
++            </div>
++          )}
++
++          <div className="ExplorerPanel__tree">
++            {loadingProjects && projects.length === 0 ? (
++              <div className="ExplorerPanel__message">
++                Projekte werden geladen…
++              </div>
++            ) : projects.length === 0 && !error ? (
++              <div className="ExplorerPanel__empty">
++                <p>
++                  Noch keine Projekte. Lege ein Projekt für deine Zeichnungen
++                  an.
++                </p>
++                <button type="button" onClick={createProject}>
++                  Neues Projekt
++                </button>
++              </div>
++            ) : (
++              projects.map((project) => {
++                const isExpanded = expandedProjects.has(project.id);
++                const files = filesByProject[project.id] || [];
++                return (
++                  <section className="ExplorerPanel__project" key={project.id}>
++                    <div
++                      className="ExplorerPanel__row ExplorerPanel__projectRow"
++                      onContextMenu={(event) =>
++                        openContextMenu(event, { kind: "project", project })
++                      }
++                    >
++                      <button
++                        className="ExplorerPanel__rowMain"
++                        type="button"
++                        aria-expanded={isExpanded}
++                        onClick={() => toggleProject(project.id)}
++                      >
++                        <span
++                          className="ExplorerPanel__chevron"
++                          aria-hidden="true"
++                        >
++                          {isExpanded ? "▾" : "▸"}
++                        </span>
++                        <span aria-hidden="true">▰</span>
++                        <span className="ExplorerPanel__name">
++                          {project.name}
++                        </span>
++                      </button>
++                      <button
++                        className="ExplorerPanel__more"
++                        type="button"
++                        aria-label={`Aktionen für ${project.name}`}
++                        onClick={(event) =>
++                          openContextMenu(event, { kind: "project", project })
++                        }
++                      >
++                        ⋮
++                      </button>
++                    </div>
++
++                    {isExpanded && (
++                      <div className="ExplorerPanel__files">
++                        {loadingFileProjects.has(project.id) ? (
++                          <div className="ExplorerPanel__message">
++                            Dateien werden geladen…
++                          </div>
++                        ) : files.length === 0 ? (
++                          <button
++                            className="ExplorerPanel__newFile"
++                            type="button"
++                            onClick={() => createFile(project)}
++                          >
++                            + Neue Zeichnung
++                          </button>
++                        ) : (
++                          <>
++                            {files.map((file) => (
++                              <div
++                                className={clsx(
++                                  "ExplorerPanel__row",
++                                  "ExplorerPanel__fileRow",
++                                  { active: file.id === activeFileId },
++                                )}
++                                key={file.id}
++                                onContextMenu={(event) =>
++                                  openContextMenu(event, { kind: "file", file })
++                                }
++                              >
++                                <button
++                                  className="ExplorerPanel__rowMain"
++                                  type="button"
++                                  onClick={() => void onOpenFile(file.id)}
++                                >
++                                  <span aria-hidden="true">◇</span>
++                                  <span className="ExplorerPanel__name">
++                                    {file.name}
++                                  </span>
++                                </button>
++                                <button
++                                  className="ExplorerPanel__more"
++                                  type="button"
++                                  aria-label={`Aktionen für ${file.name}`}
++                                  onClick={(event) =>
++                                    openContextMenu(event, {
++                                      kind: "file",
++                                      file,
++                                    })
++                                  }
++                                >
++                                  ⋮
++                                </button>
++                              </div>
++                            ))}
++                            <button
++                              className="ExplorerPanel__newFile"
++                              type="button"
++                              onClick={() => createFile(project)}
++                            >
++                              + Neue Zeichnung
++                            </button>
++                          </>
++                        )}
++                      </div>
++                    )}
++                  </section>
++                );
++              })
++            )}
++          </div>
++        </aside>
++      )}
++
++      {contextMenu && (
++        <div
++          className="ExplorerContextMenu"
++          role="menu"
++          style={{ left: contextMenu.x, top: contextMenu.y }}
++          onPointerDown={(event) => event.stopPropagation()}
++        >
++          {contextMenu.kind === "project" ? (
++            <>
++              <button
++                type="button"
++                role="menuitem"
++                onClick={() => createFile(contextMenu.project)}
++              >
++                Neue Zeichnung
++              </button>
++              <button
++                type="button"
++                role="menuitem"
++                onClick={() => renameProject(contextMenu.project)}
++              >
++                Umbenennen
++              </button>
++              <button
++                className="danger"
++                type="button"
++                role="menuitem"
++                onClick={() => deleteProject(contextMenu.project)}
++              >
++                Löschen
++              </button>
++            </>
++          ) : (
++            <>
++              <button
++                type="button"
++                role="menuitem"
++                onClick={() => renameFile(contextMenu.file)}
++              >
++                Umbenennen
++              </button>
++              {projects.length > 1 && (
++                <div className="ExplorerContextMenu__move">
++                  <span>Verschieben nach</span>
++                  {projects
++                    .filter(
++                      (project) => project.id !== contextMenu.file.projectId,
++                    )
++                    .map((project) => (
++                      <button
++                        type="button"
++                        role="menuitem"
++                        key={project.id}
++                        onClick={() => moveFile(contextMenu.file, project.id)}
++                      >
++                        {project.name}
++                      </button>
++                    ))}
++                </div>
++              )}
++              <button
++                className="danger"
++                type="button"
++                role="menuitem"
++                onClick={() => deleteFile(contextMenu.file)}
++              >
++                Löschen
++              </button>
++            </>
++          )}
++        </div>
++      )}
++    </>
++  );
++};
+diff --git a/excalidraw-app/data/explorer.ts b/excalidraw-app/data/explorer.ts
+new file mode 100644
+index 0000000..fd2b326
+--- /dev/null
++++ b/excalidraw-app/data/explorer.ts
+@@ -0,0 +1,170 @@
++import type { ExcalidrawElement } from "../../packages/excalidraw/element/types";
++import type { ImportedDataState } from "../../packages/excalidraw/data/types";
++import type { AppState, BinaryFiles } from "../../packages/excalidraw/types";
++import { serializeAsJSON } from "../../packages/excalidraw/data/json";
++
++export const EXPLORER_CURRENT_FILE_KEY = "explorer:currentFileId";
++export const EXPLORER_PANEL_OPEN_KEY = "explorer:panelOpen";
++
++export type ExplorerProject = {
++  id: string;
++  name: string;
++  createdAt: string;
++  updatedAt: string;
++};
++
++export type ExplorerFileMeta = {
++  id: string;
++  projectId: string;
++  name: string;
++  createdAt: string;
++  updatedAt: string;
++};
++
++export type ExplorerScene = {
++  type: "excalidraw";
++  version: 2;
++  elements: readonly ExcalidrawElement[];
++  appState: NonNullable<ImportedDataState["appState"]>;
++  files: BinaryFiles;
++};
++
++export type ExplorerFile = {
++  meta: ExplorerFileMeta;
++  data: ExplorerScene;
++};
++
++export class ExplorerApiError extends Error {
++  public readonly status: number;
++
++  constructor(message: string, status: number) {
++    super(message);
++    this.name = "ExplorerApiError";
++    this.status = status;
++  }
++}
++
++const getErrorMessage = (value: unknown) => {
++  if (
++    value &&
++    typeof value === "object" &&
++    "error" in value &&
++    typeof value.error === "string"
++  ) {
++    return value.error;
++  }
++  return null;
++};
++
++const request = async <T>(path: string, init?: RequestInit): Promise<T> => {
++  const response = await fetch(path, {
++    ...init,
++    headers: init?.body
++      ? { "Content-Type": "application/json", ...init.headers }
++      : init?.headers,
++  });
++
++  if (!response.ok) {
++    let message = `Explorer-Anfrage fehlgeschlagen (${response.status})`;
++    try {
++      message = getErrorMessage(await response.json()) || message;
++    } catch {
++      // The backend may be unavailable or return a non-JSON proxy response.
++    }
++    throw new ExplorerApiError(message, response.status);
++  }
++
++  if (response.status === 204) {
++    return undefined as T;
++  }
++  return response.json() as Promise<T>;
++};
++
++const projectPath = (projectId: string) =>
++  `/api/explorer/projects/${encodeURIComponent(projectId)}`;
++const filePath = (fileId: string) =>
++  `/api/explorer/files/${encodeURIComponent(fileId)}`;
++
++export const explorerApi = {
++  async getProjects() {
++    return (
++      await request<{ projects: ExplorerProject[] }>("/api/explorer/projects")
++    ).projects;
++  },
++
++  createProject(name: string) {
++    return request<ExplorerProject>("/api/explorer/projects", {
++      method: "POST",
++      body: JSON.stringify({ name }),
++    });
++  },
++
++  renameProject(projectId: string, name: string) {
++    return request<ExplorerProject>(projectPath(projectId), {
++      method: "PATCH",
++      body: JSON.stringify({ name }),
++    });
++  },
++
++  deleteProject(projectId: string) {
++    return request<void>(projectPath(projectId), { method: "DELETE" });
++  },
++
++  async getFiles(projectId: string) {
++    return (
++      await request<{ files: ExplorerFileMeta[] }>(
++        `${projectPath(projectId)}/files`,
++      )
++    ).files;
++  },
++
++  createFile(projectId: string, name: string, data?: ExplorerScene) {
++    return request<ExplorerFileMeta>(`${projectPath(projectId)}/files`, {
++      method: "POST",
++      body: JSON.stringify({ name, ...(data ? { data } : {}) }),
++    });
++  },
++
++  getFile(fileId: string) {
++    return request<ExplorerFile>(filePath(fileId));
++  },
++
++  updateFile(
++    fileId: string,
++    changes: {
++      name?: string;
++      projectId?: string;
++      data?: ExplorerScene;
++    },
++  ) {
++    return request<ExplorerFileMeta>(filePath(fileId), {
++      method: "PUT",
++      body: JSON.stringify(changes),
++    });
++  },
++
++  deleteFile(fileId: string) {
++    return request<void>(filePath(fileId), { method: "DELETE" });
++  },
++};
++
++export const createExplorerScene = (
++  elements: readonly ExcalidrawElement[],
++  appState: AppState,
++  files: BinaryFiles,
++): ExplorerScene => {
++  const serialized = JSON.parse(
++    serializeAsJSON(elements, appState, files, "local"),
++  ) as ImportedDataState;
++
++  return {
++    type: "excalidraw",
++    version: 2,
++    elements: serialized.elements || [],
++    appState: serialized.appState || {},
++    files: serialized.files || {},
++  };
++};
++
++export const getExplorerErrorMessage = (error: unknown) =>
++  error instanceof Error ? error.message : "Unbekannter Explorer-Fehler";
+-- 
+2.39.5 (Apple Git-154)
+
