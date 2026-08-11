@@ -1,7 +1,7 @@
 From 1f58045a06d272c9a824b7b46a2589fe93d577e0 Mon Sep 17 00:00:00 2001
 From: Michael Be <m.gonser@icloud.com>
 Date: Tue, 11 Aug 2026 12:09:55 +0200
-Subject: [PATCH 1/2] feat: add project & file explorer panel
+Subject: [PATCH 1/3] feat: add project & file explorer panel
  (Excalidraw-Plus-style)
 
 Left-docked Files panel with project/file tree backed by /api/explorer:
@@ -1500,7 +1500,7 @@ index 0000000..fd2b326
 From 880c7a4f4d64a6aa2c37b0ccad4bacb17aa849b5 Mon Sep 17 00:00:00 2001
 From: Michael Be <m.gonser@icloud.com>
 Date: Tue, 11 Aug 2026 13:07:56 +0200
-Subject: [PATCH 2/2] fix: explorer E2E findings (autosave loop, stale canvas,
+Subject: [PATCH 2/3] fix: explorer E2E findings (autosave loop, stale canvas,
  dark mode, tree state, z-order)
 
 - content-based dirty detection via scene fingerprint instead of marking
@@ -1753,6 +1753,790 @@ index 93c6bf6..5f02d54 100644
    useEffect(() => {
      if (!contextMenu) {
        return;
+-- 
+2.39.5 (Apple Git-154)
+
+
+From 7811a7222381bcc1edd4becc92372f939b39dce4 Mon Sep 17 00:00:00 2001
+From: Michael Be <m.gonser@icloud.com>
+Date: Tue, 11 Aug 2026 13:55:03 +0200
+Subject: [PATCH 3/3] feat: explorer drag & drop and custom dialogs
+
+- name/delete dialogs built on the package's Dialog/ConfirmDialog/TextField
+  (validation, Enter/Escape, autofocus, cascade warning); no native
+  prompt/confirm left in explorer code
+- file rows draggable onto project rows (ref-based state so synthetic
+  DataTransfer events work), drop target highlight, own project excluded,
+  context-menu move kept as fallback
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../explorer/ExplorerDeleteConfirmDialog.tsx  |  38 ++
+ .../components/explorer/ExplorerDialogs.scss  |  41 ++
+ .../explorer/ExplorerNameDialog.tsx           |  84 ++++
+ .../components/explorer/ExplorerPanel.scss    |  15 +
+ .../components/explorer/ExplorerPanel.tsx     | 361 +++++++++++++++---
+ 5 files changed, 491 insertions(+), 48 deletions(-)
+ create mode 100644 excalidraw-app/components/explorer/ExplorerDeleteConfirmDialog.tsx
+ create mode 100644 excalidraw-app/components/explorer/ExplorerDialogs.scss
+ create mode 100644 excalidraw-app/components/explorer/ExplorerNameDialog.tsx
+
+diff --git a/excalidraw-app/components/explorer/ExplorerDeleteConfirmDialog.tsx b/excalidraw-app/components/explorer/ExplorerDeleteConfirmDialog.tsx
+new file mode 100644
+index 0000000..d58762b
+--- /dev/null
++++ b/excalidraw-app/components/explorer/ExplorerDeleteConfirmDialog.tsx
+@@ -0,0 +1,38 @@
++import ConfirmDialog from "../../../packages/excalidraw/components/ConfirmDialog";
++
++type ExplorerDeleteConfirmDialogProps = {
++  itemKind: "project" | "file";
++  itemName: string;
++  onConfirm: () => void;
++  onCancel: () => void;
++};
++
++export const ExplorerDeleteConfirmDialog = ({
++  itemKind,
++  itemName,
++  onConfirm,
++  onCancel,
++}: ExplorerDeleteConfirmDialogProps) => {
++  const isProject = itemKind === "project";
++  const itemLabel = isProject ? "Projekt" : "Zeichnung";
++
++  return (
++    <ConfirmDialog
++      className="ExplorerDeleteConfirmDialog"
++      title={`${itemLabel} löschen`}
++      confirmText={`${itemLabel} löschen`}
++      cancelText="Abbrechen"
++      onConfirm={onConfirm}
++      onCancel={onCancel}
++    >
++      <p>
++        {itemLabel} „{itemName}“ wirklich löschen?
++      </p>
++      {isProject && (
++        <p className="ExplorerDeleteConfirmDialog__cascadeWarning">
++          Alle im Projekt enthaltenen Dateien werden ebenfalls gelöscht.
++        </p>
++      )}
++    </ConfirmDialog>
++  );
++};
+diff --git a/excalidraw-app/components/explorer/ExplorerDialogs.scss b/excalidraw-app/components/explorer/ExplorerDialogs.scss
+new file mode 100644
+index 0000000..da227e1
+--- /dev/null
++++ b/excalidraw-app/components/explorer/ExplorerDialogs.scss
+@@ -0,0 +1,41 @@
++.excalidraw {
++  .ExplorerNameDialog {
++    form {
++      display: flex;
++      flex-direction: column;
++    }
++  }
++
++  .ExplorerNameDialog__validation {
++    min-height: 1.25rem;
++    margin-top: 0.25rem;
++    color: var(--color-muted-darker);
++    font-size: 0.75rem;
++    text-align: right;
++  }
++
++  .ExplorerDialog__buttons {
++    display: flex;
++    justify-content: flex-end;
++    gap: 0.5rem;
++    margin-top: 1rem;
++
++    .Dialog__action-button:disabled {
++      cursor: not-allowed;
++      opacity: 0.5;
++    }
++  }
++
++  .ExplorerDeleteConfirmDialog {
++    p {
++      margin: 0 0 1.25rem;
++      line-height: 1.5;
++    }
++
++    .ExplorerDeleteConfirmDialog__cascadeWarning {
++      margin-top: -0.75rem;
++      color: var(--color-danger);
++      font-weight: 600;
++    }
++  }
++}
+diff --git a/excalidraw-app/components/explorer/ExplorerNameDialog.tsx b/excalidraw-app/components/explorer/ExplorerNameDialog.tsx
+new file mode 100644
+index 0000000..73e8ebc
+--- /dev/null
++++ b/excalidraw-app/components/explorer/ExplorerNameDialog.tsx
+@@ -0,0 +1,84 @@
++import { FormEvent, KeyboardEvent, useState } from "react";
++
++import { Dialog } from "../../../packages/excalidraw/components/Dialog";
++import DialogActionButton from "../../../packages/excalidraw/components/DialogActionButton";
++import { TextField } from "../../../packages/excalidraw/components/TextField";
++
++import "./ExplorerDialogs.scss";
++
++type ExplorerNameDialogProps = {
++  title: string;
++  label: string;
++  initialName?: string;
++  confirmText: string;
++  onConfirm: (name: string) => void;
++  onCancel: () => void;
++};
++
++const MAX_NAME_LENGTH = 200;
++
++export const ExplorerNameDialog = ({
++  title,
++  label,
++  initialName = "",
++  confirmText,
++  onConfirm,
++  onCancel,
++}: ExplorerNameDialogProps) => {
++  const [name, setName] = useState(initialName);
++  const normalizedName = name.trim();
++  const isValid =
++    normalizedName.length > 0 && normalizedName.length <= MAX_NAME_LENGTH;
++
++  const submitName = () => {
++    if (isValid) {
++      onConfirm(normalizedName);
++    }
++  };
++
++  const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
++    event.preventDefault();
++    submitName();
++  };
++
++  const handleInputKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
++    if (event.key === "Enter") {
++      event.preventDefault();
++      submitName();
++    }
++  };
++
++  return (
++    <Dialog
++      className="ExplorerNameDialog"
++      size="small"
++      title={title}
++      onCloseRequest={onCancel}
++    >
++      <form onSubmit={handleSubmit}>
++        <TextField
++          fullWidth
++          label={label}
++          value={name}
++          onChange={setName}
++          onKeyDown={handleInputKeyDown}
++          selectOnRender
++        />
++        <div className="ExplorerNameDialog__validation" aria-live="polite">
++          {normalizedName.length > MAX_NAME_LENGTH
++            ? `Maximal ${MAX_NAME_LENGTH} Zeichen erlaubt.`
++            : `${normalizedName.length}/${MAX_NAME_LENGTH}`}
++        </div>
++        <div className="ExplorerDialog__buttons">
++          <DialogActionButton label="Abbrechen" onClick={onCancel} />
++          <DialogActionButton
++            actionType="primary"
++            disabled={!isValid}
++            label={confirmText}
++            type="submit"
++          />
++        </div>
++      </form>
++    </Dialog>
++  );
++};
+diff --git a/excalidraw-app/components/explorer/ExplorerPanel.scss b/excalidraw-app/components/explorer/ExplorerPanel.scss
+index 02f716e..d941e44 100644
+--- a/excalidraw-app/components/explorer/ExplorerPanel.scss
++++ b/excalidraw-app/components/explorer/ExplorerPanel.scss
+@@ -146,10 +146,25 @@
+ 
+   .ExplorerPanel__projectRow {
+     font-weight: 600;
++
++    &.is-drop-target {
++      background: var(--color-surface-primary-container);
++      box-shadow: inset 0 0 0 2px var(--color-primary);
++      color: var(--color-on-primary-container);
++    }
+   }
+ 
+   .ExplorerPanel__fileRow {
+     padding-left: 1.35rem;
++    cursor: grab;
++
++    &.is-dragging {
++      opacity: 0.45;
++    }
++
++    &:active {
++      cursor: grabbing;
++    }
+   }
+ 
+   .ExplorerPanel__rowMain {
+diff --git a/excalidraw-app/components/explorer/ExplorerPanel.tsx b/excalidraw-app/components/explorer/ExplorerPanel.tsx
+index 5f02d54..5472438 100644
+--- a/excalidraw-app/components/explorer/ExplorerPanel.tsx
++++ b/excalidraw-app/components/explorer/ExplorerPanel.tsx
+@@ -1,4 +1,4 @@
+-import React, { useCallback, useEffect, useState } from "react";
++import React, { useCallback, useEffect, useRef, useState } from "react";
+ import clsx from "clsx";
+ 
+ import {
+@@ -8,6 +8,8 @@ import {
+   explorerApi,
+   getExplorerErrorMessage,
+ } from "../../data/explorer";
++import { ExplorerDeleteConfirmDialog } from "./ExplorerDeleteConfirmDialog";
++import { ExplorerNameDialog } from "./ExplorerNameDialog";
+ 
+ import "./ExplorerPanel.scss";
+ 
+@@ -22,6 +24,16 @@ type ContextMenuState =
+   | { kind: "project"; project: ExplorerProject; x: number; y: number }
+   | { kind: "file"; file: ExplorerFileMeta; x: number; y: number };
+ 
++type NameDialogState =
++  | { kind: "createProject" }
++  | { kind: "renameProject"; project: ExplorerProject }
++  | { kind: "createFile"; project: ExplorerProject }
++  | { kind: "renameFile"; file: ExplorerFileMeta };
++
++type DeleteDialogState =
++  | { kind: "project"; project: ExplorerProject }
++  | { kind: "file"; file: ExplorerFileMeta };
++
+ type ExplorerPanelProps = {
+   activeFileId: string | null;
+   activeProjectId: string | null;
+@@ -36,9 +48,17 @@ type ExplorerPanelProps = {
+ const sortByName = <T extends { name: string }>(items: T[]) =>
+   [...items].sort((a, b) => a.name.localeCompare(b.name));
+ 
+-const getPromptName = (label: string, currentName = "") => {
+-  const value = window.prompt(label, currentName);
+-  return value?.trim() || null;
++const EXPLORER_FILE_DRAG_TYPE = "application/x-excalidraw-explorer-file";
++
++const setDropEffect = (
++  dataTransfer: DataTransfer,
++  effect: DataTransfer["dropEffect"],
++) => {
++  try {
++    dataTransfer.dropEffect = effect;
++  } catch {
++    // A restricted synthetic DataTransfer may expose dropEffect as read-only.
++  }
+ };
+ 
+ export const ExplorerPanel = ({
+@@ -68,6 +88,16 @@ export const ExplorerPanel = ({
+   );
+   const [error, setError] = useState<string | null>(null);
+   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
++  const [nameDialog, setNameDialog] = useState<NameDialogState | null>(null);
++  const [deleteDialog, setDeleteDialog] = useState<DeleteDialogState | null>(
++    null,
++  );
++  const [draggedFileId, setDraggedFileId] = useState<string | null>(null);
++  const [dragOverProjectId, setDragOverProjectId] = useState<string | null>(
++    null,
++  );
++  const draggedFileRef = useRef<ExplorerFileMeta | null>(null);
++  const suppressFileClickRef = useRef(false);
+ 
+   const reportError = useCallback(
+     (caught: unknown) => {
+@@ -166,12 +196,7 @@ export const ExplorerPanel = ({
+     };
+   }, [contextMenu]);
+ 
+-  const createProject = async () => {
+-    setContextMenu(null);
+-    const name = getPromptName("Name des neuen Projekts");
+-    if (!name) {
+-      return;
+-    }
++  const createProject = async (name: string) => {
+     try {
+       const project = await explorerApi.createProject(name);
+       setProjects((current) => sortByName([...current, project]));
+@@ -183,10 +208,8 @@ export const ExplorerPanel = ({
+     }
+   };
+ 
+-  const renameProject = async (project: ExplorerProject) => {
+-    setContextMenu(null);
+-    const name = getPromptName("Projekt umbenennen", project.name);
+-    if (!name || name === project.name) {
++  const renameProject = async (project: ExplorerProject, name: string) => {
++    if (name === project.name) {
+       return;
+     }
+     try {
+@@ -202,14 +225,6 @@ export const ExplorerPanel = ({
+   };
+ 
+   const deleteProject = async (project: ExplorerProject) => {
+-    setContextMenu(null);
+-    if (
+-      !window.confirm(
+-        `Projekt „${project.name}“ wirklich löschen? Alle enthaltenen Dateien werden ebenfalls gelöscht.`,
+-      )
+-    ) {
+-      return;
+-    }
+     try {
+       await explorerApi.deleteProject(project.id);
+       setProjects((current) =>
+@@ -228,12 +243,7 @@ export const ExplorerPanel = ({
+     }
+   };
+ 
+-  const createFile = async (project: ExplorerProject) => {
+-    setContextMenu(null);
+-    const name = getPromptName("Name der neuen Zeichnung");
+-    if (!name) {
+-      return;
+-    }
++  const createFile = async (project: ExplorerProject, name: string) => {
+     try {
+       const file = await explorerApi.createFile(project.id, name);
+       setFilesByProject((current) => ({
+@@ -247,10 +257,8 @@ export const ExplorerPanel = ({
+     }
+   };
+ 
+-  const renameFile = async (file: ExplorerFileMeta) => {
+-    setContextMenu(null);
+-    const name = getPromptName("Zeichnung umbenennen", file.name);
+-    if (!name || name === file.name) {
++  const renameFile = async (file: ExplorerFileMeta, name: string) => {
++    if (name === file.name) {
+       return;
+     }
+     try {
+@@ -272,10 +280,6 @@ export const ExplorerPanel = ({
+   };
+ 
+   const deleteFile = async (file: ExplorerFileMeta) => {
+-    setContextMenu(null);
+-    if (!window.confirm(`Zeichnung „${file.name}“ wirklich löschen?`)) {
+-      return;
+-    }
+     try {
+       await explorerApi.deleteFile(file.id);
+       setFilesByProject((current) => ({
+@@ -292,6 +296,53 @@ export const ExplorerPanel = ({
+     }
+   };
+ 
++  const openNameDialog = (dialog: NameDialogState) => {
++    setContextMenu(null);
++    setNameDialog(dialog);
++  };
++
++  const confirmNameDialog = (name: string) => {
++    const dialog = nameDialog;
++    setNameDialog(null);
++    if (!dialog) {
++      return;
++    }
++
++    switch (dialog.kind) {
++      case "createProject":
++        void createProject(name);
++        break;
++      case "renameProject":
++        void renameProject(dialog.project, name);
++        break;
++      case "createFile":
++        void createFile(dialog.project, name);
++        break;
++      case "renameFile":
++        void renameFile(dialog.file, name);
++        break;
++    }
++  };
++
++  const openDeleteDialog = (dialog: DeleteDialogState) => {
++    setContextMenu(null);
++    setDeleteDialog(dialog);
++  };
++
++  const confirmDeleteDialog = () => {
++    const dialog = deleteDialog;
++    setDeleteDialog(null);
++    if (!dialog) {
++      return;
++    }
++
++    if (dialog.kind === "project") {
++      void deleteProject(dialog.project);
++    } else {
++      void deleteFile(dialog.file);
++    }
++  };
++
+   const moveFile = async (file: ExplorerFileMeta, projectId: string) => {
+     setContextMenu(null);
+     try {
+@@ -312,6 +363,117 @@ export const ExplorerPanel = ({
+     }
+   };
+ 
++  const findDraggedFile = (dataTransfer: DataTransfer) => {
++    if (draggedFileRef.current) {
++      return draggedFileRef.current;
++    }
++
++    let transferredFileId = "";
++    try {
++      transferredFileId = dataTransfer.getData(EXPLORER_FILE_DRAG_TYPE);
++    } catch {
++      // Some test environments expose a restricted DataTransfer implementation.
++    }
++    const fileId = draggedFileId || transferredFileId;
++    if (!fileId) {
++      return null;
++    }
++
++    return (
++      Object.values(filesByProject)
++        .flat()
++        .find((file) => file.id === fileId) || null
++    );
++  };
++
++  const clearDragState = () => {
++    draggedFileRef.current = null;
++    setDraggedFileId(null);
++    setDragOverProjectId(null);
++  };
++
++  const handleFileDragStart = (
++    event: React.DragEvent<HTMLDivElement>,
++    file: ExplorerFileMeta,
++  ) => {
++    draggedFileRef.current = file;
++    suppressFileClickRef.current = true;
++    setDraggedFileId(file.id);
++    setDragOverProjectId(null);
++    setContextMenu(null);
++
++    try {
++      event.dataTransfer.setData(EXPLORER_FILE_DRAG_TYPE, file.id);
++      event.dataTransfer.setData("text/plain", file.id);
++      event.dataTransfer.effectAllowed = "move";
++    } catch {
++      // The React ref remains the source of truth if DataTransfer is restricted.
++    }
++  };
++
++  const handleFileDragEnd = () => {
++    clearDragState();
++    window.setTimeout(() => {
++      suppressFileClickRef.current = false;
++    }, 0);
++  };
++
++  const handleFileClick = (fileId: string) => {
++    if (suppressFileClickRef.current) {
++      suppressFileClickRef.current = false;
++      return;
++    }
++    void onOpenFile(fileId);
++  };
++
++  const handleProjectDragOver = (
++    event: React.DragEvent<HTMLDivElement>,
++    projectId: string,
++  ) => {
++    const file = findDraggedFile(event.dataTransfer);
++    if (!file || file.projectId === projectId) {
++      setDropEffect(event.dataTransfer, "none");
++      setDragOverProjectId((current) =>
++        current === projectId ? null : current,
++      );
++      return;
++    }
++
++    event.preventDefault();
++    setDropEffect(event.dataTransfer, "move");
++    setDragOverProjectId(projectId);
++  };
++
++  const handleProjectDragLeave = (
++    event: React.DragEvent<HTMLDivElement>,
++    projectId: string,
++  ) => {
++    if (
++      event.relatedTarget instanceof Node &&
++      event.currentTarget.contains(event.relatedTarget)
++    ) {
++      return;
++    }
++    setDragOverProjectId((current) => (current === projectId ? null : current));
++  };
++
++  const handleProjectDrop = (
++    event: React.DragEvent<HTMLDivElement>,
++    projectId: string,
++  ) => {
++    const file = findDraggedFile(event.dataTransfer);
++    if (!file || file.projectId === projectId) {
++      setDropEffect(event.dataTransfer, "none");
++      clearDragState();
++      return;
++    }
++
++    event.preventDefault();
++    event.stopPropagation();
++    clearDragState();
++    void moveFile(file, projectId);
++  };
++
+   const toggleProject = (projectId: string) => {
+     const isExpanded = expandedProjects.has(projectId);
+     setExpandedProjects((current) => {
+@@ -382,7 +544,7 @@ export const ExplorerPanel = ({
+               <button
+                 type="button"
+                 title="Neues Projekt"
+-                onClick={createProject}
++                onClick={() => openNameDialog({ kind: "createProject" })}
+               >
+                 +
+               </button>
+@@ -417,7 +579,10 @@ export const ExplorerPanel = ({
+                   Noch keine Projekte. Lege ein Projekt für deine Zeichnungen
+                   an.
+                 </p>
+-                <button type="button" onClick={createProject}>
++                <button
++                  type="button"
++                  onClick={() => openNameDialog({ kind: "createProject" })}
++                >
+                   Neues Projekt
+                 </button>
+               </div>
+@@ -428,7 +593,21 @@ export const ExplorerPanel = ({
+                 return (
+                   <section className="ExplorerPanel__project" key={project.id}>
+                     <div
+-                      className="ExplorerPanel__row ExplorerPanel__projectRow"
++                      className={clsx(
++                        "ExplorerPanel__row",
++                        "ExplorerPanel__projectRow",
++                        {
++                          "is-drop-target": dragOverProjectId === project.id,
++                        },
++                      )}
++                      data-project-id={project.id}
++                      onDragOver={(event) =>
++                        handleProjectDragOver(event, project.id)
++                      }
++                      onDragLeave={(event) =>
++                        handleProjectDragLeave(event, project.id)
++                      }
++                      onDrop={(event) => handleProjectDrop(event, project.id)}
+                       onContextMenu={(event) =>
+                         openContextMenu(event, { kind: "project", project })
+                       }
+@@ -472,7 +651,9 @@ export const ExplorerPanel = ({
+                           <button
+                             className="ExplorerPanel__newFile"
+                             type="button"
+-                            onClick={() => createFile(project)}
++                            onClick={() =>
++                              openNameDialog({ kind: "createFile", project })
++                            }
+                           >
+                             + Neue Zeichnung
+                           </button>
+@@ -483,9 +664,18 @@ export const ExplorerPanel = ({
+                                 className={clsx(
+                                   "ExplorerPanel__row",
+                                   "ExplorerPanel__fileRow",
+-                                  { active: file.id === activeFileId },
++                                  {
++                                    active: file.id === activeFileId,
++                                    "is-dragging": file.id === draggedFileId,
++                                  },
+                                 )}
+                                 key={file.id}
++                                data-file-id={file.id}
++                                draggable
++                                onDragStart={(event) =>
++                                  handleFileDragStart(event, file)
++                                }
++                                onDragEnd={handleFileDragEnd}
+                                 onContextMenu={(event) =>
+                                   openContextMenu(event, { kind: "file", file })
+                                 }
+@@ -493,7 +683,7 @@ export const ExplorerPanel = ({
+                                 <button
+                                   className="ExplorerPanel__rowMain"
+                                   type="button"
+-                                  onClick={() => void onOpenFile(file.id)}
++                                  onClick={() => handleFileClick(file.id)}
+                                 >
+                                   <span aria-hidden="true">◇</span>
+                                   <span className="ExplorerPanel__name">
+@@ -518,7 +708,9 @@ export const ExplorerPanel = ({
+                             <button
+                               className="ExplorerPanel__newFile"
+                               type="button"
+-                              onClick={() => createFile(project)}
++                              onClick={() =>
++                                openNameDialog({ kind: "createFile", project })
++                              }
+                             >
+                               + Neue Zeichnung
+                             </button>
+@@ -546,14 +738,24 @@ export const ExplorerPanel = ({
+               <button
+                 type="button"
+                 role="menuitem"
+-                onClick={() => createFile(contextMenu.project)}
++                onClick={() =>
++                  openNameDialog({
++                    kind: "createFile",
++                    project: contextMenu.project,
++                  })
++                }
+               >
+                 Neue Zeichnung
+               </button>
+               <button
+                 type="button"
+                 role="menuitem"
+-                onClick={() => renameProject(contextMenu.project)}
++                onClick={() =>
++                  openNameDialog({
++                    kind: "renameProject",
++                    project: contextMenu.project,
++                  })
++                }
+               >
+                 Umbenennen
+               </button>
+@@ -561,7 +763,12 @@ export const ExplorerPanel = ({
+                 className="danger"
+                 type="button"
+                 role="menuitem"
+-                onClick={() => deleteProject(contextMenu.project)}
++                onClick={() =>
++                  openDeleteDialog({
++                    kind: "project",
++                    project: contextMenu.project,
++                  })
++                }
+               >
+                 Löschen
+               </button>
+@@ -571,7 +778,12 @@ export const ExplorerPanel = ({
+               <button
+                 type="button"
+                 role="menuitem"
+-                onClick={() => renameFile(contextMenu.file)}
++                onClick={() =>
++                  openNameDialog({
++                    kind: "renameFile",
++                    file: contextMenu.file,
++                  })
++                }
+               >
+                 Umbenennen
+               </button>
+@@ -598,7 +810,12 @@ export const ExplorerPanel = ({
+                 className="danger"
+                 type="button"
+                 role="menuitem"
+-                onClick={() => deleteFile(contextMenu.file)}
++                onClick={() =>
++                  openDeleteDialog({
++                    kind: "file",
++                    file: contextMenu.file,
++                  })
++                }
+               >
+                 Löschen
+               </button>
+@@ -606,6 +823,54 @@ export const ExplorerPanel = ({
+           )}
+         </div>
+       )}
++
++      {nameDialog && (
++        <ExplorerNameDialog
++          title={
++            nameDialog.kind === "createProject"
++              ? "Neues Projekt"
++              : nameDialog.kind === "renameProject"
++              ? "Projekt umbenennen"
++              : nameDialog.kind === "createFile"
++              ? "Neue Zeichnung"
++              : "Zeichnung umbenennen"
++          }
++          label={
++            nameDialog.kind === "createProject" ||
++            nameDialog.kind === "renameProject"
++              ? "Projektname"
++              : "Zeichnungsname"
++          }
++          initialName={
++            nameDialog.kind === "renameProject"
++              ? nameDialog.project.name
++              : nameDialog.kind === "renameFile"
++              ? nameDialog.file.name
++              : ""
++          }
++          confirmText={
++            nameDialog.kind === "createProject" ||
++            nameDialog.kind === "createFile"
++              ? "Anlegen"
++              : "Umbenennen"
++          }
++          onConfirm={confirmNameDialog}
++          onCancel={() => setNameDialog(null)}
++        />
++      )}
++
++      {deleteDialog && (
++        <ExplorerDeleteConfirmDialog
++          itemKind={deleteDialog.kind}
++          itemName={
++            deleteDialog.kind === "project"
++              ? deleteDialog.project.name
++              : deleteDialog.file.name
++          }
++          onConfirm={confirmDeleteDialog}
++          onCancel={() => setDeleteDialog(null)}
++        />
++      )}
+     </>
+   );
+ };
 -- 
 2.39.5 (Apple Git-154)
 
