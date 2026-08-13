@@ -1,7 +1,7 @@
 From 1f58045a06d272c9a824b7b46a2589fe93d577e0 Mon Sep 17 00:00:00 2001
 From: Michael Be <m.gonser@icloud.com>
 Date: Tue, 11 Aug 2026 12:09:55 +0200
-Subject: [PATCH 1/4] feat: add project & file explorer panel
+Subject: [PATCH 1/5] feat: add project & file explorer panel
  (Excalidraw-Plus-style)
 
 Left-docked Files panel with project/file tree backed by /api/explorer:
@@ -1500,7 +1500,7 @@ index 0000000..fd2b326
 From 880c7a4f4d64a6aa2c37b0ccad4bacb17aa849b5 Mon Sep 17 00:00:00 2001
 From: Michael Be <m.gonser@icloud.com>
 Date: Tue, 11 Aug 2026 13:07:56 +0200
-Subject: [PATCH 2/4] fix: explorer E2E findings (autosave loop, stale canvas,
+Subject: [PATCH 2/5] fix: explorer E2E findings (autosave loop, stale canvas,
  dark mode, tree state, z-order)
 
 - content-based dirty detection via scene fingerprint instead of marking
@@ -1760,7 +1760,7 @@ index 93c6bf6..5f02d54 100644
 From 7811a7222381bcc1edd4becc92372f939b39dce4 Mon Sep 17 00:00:00 2001
 From: Michael Be <m.gonser@icloud.com>
 Date: Tue, 11 Aug 2026 13:55:03 +0200
-Subject: [PATCH 3/4] feat: explorer drag & drop and custom dialogs
+Subject: [PATCH 3/5] feat: explorer drag & drop and custom dialogs
 
 - name/delete dialogs built on the package's Dialog/ConfirmDialog/TextField
   (validation, Enter/Escape, autofocus, cascade warning); no native
@@ -2544,7 +2544,7 @@ index 5f02d54..5472438 100644
 From 56d5ce84f2572d20329c13a28c30afd3eecc1e69 Mon Sep 17 00:00:00 2001
 From: Michael Be <m.gonser@icloud.com>
 Date: Tue, 11 Aug 2026 14:53:38 +0200
-Subject: [PATCH 4/4] feat: integrate explorer into native open flow and main
+Subject: [PATCH 4/5] feat: integrate explorer into native open flow and main
  menu
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -3492,6 +3492,1734 @@ index d7f701f..3ce72ef 100644
    initialData?: MaybePromise<ExcalidrawInitialDataState | null>;
    excalidrawAPI?: (api: ExcalidrawImperativeAPI) => void;
    isCollaborating?: boolean;
+-- 
+2.39.5 (Apple Git-154)
+
+
+From 1297989658e006cb32367cace1c72dc8003f2230 Mon Sep 17 00:00:00 2001
+From: Michael Be <m.gonser@icloud.com>
+Date: Thu, 13 Aug 2026 15:10:44 +0200
+Subject: [PATCH 5/5] feat: files explorer as a real, toggleable sidebar
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The explorer panel used to float above the canvas as an absolutely
+positioned overlay that started below the toolbar row and had to fight
+Excalidraw's z-index stack. It is now a proper layout column:
+
+- excalidraw-app renders a flex row (sidebar | canvas), so the canvas
+  never sits under the panel; Excalidraw resizes via its ResizeObserver.
+- The panel keeps living inside <Excalidraw> (its dialogs need the
+  editor context) but is portaled into the sidebar column; the portal
+  root carries `excalidraw` + theme class so CSS variables resolve, and
+  paints an opaque background so nothing shows through.
+- Visible by default, collapsible via the header button, the floating
+  "Files" island button, the new main menu entry or Alt+F. Open state
+  and width are persisted in localStorage.
+- Width is drag-resizable (200–520px, keyboard-adjustable separator).
+- Below 730px the sidebar overlays the canvas with a backdrop instead of
+  squeezing it, and starts collapsed.
+- Tree glyphs (☰ ▰ ◇ ⋮ ▾) replaced by inline SVG icons in
+  ExplorerIcons.tsx, used by the panel and the open dialog.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ excalidraw-app/App.tsx                        | 536 +++++++++++-------
+ excalidraw-app/components/AppMainMenu.tsx     |  13 +
+ .../components/explorer/ExplorerDialogs.scss  |  12 +-
+ .../components/explorer/ExplorerIcons.tsx     |  61 ++
+ .../explorer/ExplorerOpenDialog.tsx           |  17 +-
+ .../components/explorer/ExplorerPanel.scss    | 135 +++--
+ .../components/explorer/ExplorerPanel.tsx     | 488 +++++++++-------
+ excalidraw-app/data/explorer.ts               |  27 +
+ excalidraw-app/index.scss                     |  86 +++
+ 9 files changed, 929 insertions(+), 446 deletions(-)
+ create mode 100644 excalidraw-app/components/explorer/ExplorerIcons.tsx
+
+diff --git a/excalidraw-app/App.tsx b/excalidraw-app/App.tsx
+index 8c7f63b..eba6b94 100644
+--- a/excalidraw-app/App.tsx
++++ b/excalidraw-app/App.tsx
+@@ -109,11 +109,16 @@ import { ShareDialog, shareDialogStateAtom } from "./share/ShareDialog";
+ import CollabError, { collabErrorIndicatorAtom } from "./collab/CollabError";
+ import {
+   EXPLORER_CURRENT_FILE_KEY,
++  EXPLORER_PANEL_OPEN_KEY,
++  EXPLORER_PANEL_OVERLAY_BREAKPOINT,
++  EXPLORER_PANEL_WIDTH_KEY,
+   ExplorerFileMeta,
+   ExplorerScene,
+   createExplorerScene,
+   explorerApi,
+   getExplorerErrorMessage,
++  readExplorerPanelOpen,
++  readExplorerPanelWidth,
+ } from "./data/explorer";
+ import {
+   ExplorerPanel,
+@@ -343,6 +348,24 @@ const ExcalidrawWrapper = () => {
+   const [isSaveToProjectDialogOpen, setIsSaveToProjectDialogOpen] =
+     useState(false);
+   const [explorerPanelRefreshToken, setExplorerPanelRefreshToken] = useState(0);
++  const [explorerSidebarHost, setExplorerSidebarHost] =
++    useState<HTMLDivElement | null>(null);
++  const [isExplorerPanelOpen, setIsExplorerPanelOpen] = useState(
++    () =>
++      readExplorerPanelOpen() &&
++      !window.matchMedia(`(max-width: ${EXPLORER_PANEL_OVERLAY_BREAKPOINT}px)`)
++        .matches,
++  );
++  const [explorerPanelWidth, setExplorerPanelWidth] = useState(
++    readExplorerPanelWidth,
++  );
++  // Auf schmalen Viewports überlagert die Sidebar den Canvas, statt ihn zu
++  // verschmälern — sonst bliebe kaum Zeichenfläche übrig.
++  const [isNarrowViewport, setIsNarrowViewport] = useState(
++    () =>
++      window.matchMedia(`(max-width: ${EXPLORER_PANEL_OVERLAY_BREAKPOINT}px)`)
++        .matches,
++  );
+   const activeExplorerFileIdRef = useRef(activeExplorerFileId);
+   const explorerSceneRef = useRef<ExplorerScene | null>(null);
+   const explorerSavedSceneFingerprintRef = useRef<string | null>(null);
+@@ -356,6 +379,63 @@ const ExcalidrawWrapper = () => {
+ 
+   isCollaboratingRef.current = isCollaborating;
+ 
++  useEffect(() => {
++    const mediaQuery = window.matchMedia(
++      `(max-width: ${EXPLORER_PANEL_OVERLAY_BREAKPOINT}px)`,
++    );
++    const handleChange = (event: MediaQueryListEvent) => {
++      setIsNarrowViewport(event.matches);
++      // Beim Wechsel auf schmal einklappen, beim Zurückwechseln die
++      // gespeicherte Desktop-Vorliebe wiederherstellen.
++      setIsExplorerPanelOpen(event.matches ? false : readExplorerPanelOpen());
++    };
++    mediaQuery.addEventListener("change", handleChange);
++    return () => mediaQuery.removeEventListener("change", handleChange);
++  }, []);
++
++  useEffect(() => {
++    // Auf schmalen Viewports ist der eingeklappte Zustand nur situativ — die
++    // gespeicherte Vorliebe soll für den Desktop erhalten bleiben.
++    if (!isNarrowViewport) {
++      localStorage.setItem(
++        EXPLORER_PANEL_OPEN_KEY,
++        String(isExplorerPanelOpen),
++      );
++    }
++  }, [isExplorerPanelOpen, isNarrowViewport]);
++
++  useEffect(() => {
++    localStorage.setItem(EXPLORER_PANEL_WIDTH_KEY, String(explorerPanelWidth));
++  }, [explorerPanelWidth]);
++
++  useEffect(() => {
++    const handleKeyDown = (event: KeyboardEvent) => {
++      if (
++        event.code !== "KeyF" ||
++        !event.altKey ||
++        event.ctrlKey ||
++        event.metaKey ||
++        event.shiftKey
++      ) {
++        return;
++      }
++      const target = event.target as HTMLElement | null;
++      if (
++        target &&
++        (target.tagName === "INPUT" ||
++          target.tagName === "TEXTAREA" ||
++          target.isContentEditable)
++      ) {
++        return;
++      }
++      event.preventDefault();
++      setIsExplorerPanelOpen((current) => !current);
++    };
++
++    window.addEventListener("keydown", handleKeyDown);
++    return () => window.removeEventListener("keydown", handleKeyDown);
++  }, []);
++
+   const setActiveExplorerFile = useCallback((file: ExplorerFileMeta | null) => {
+     const fileId = file?.id || null;
+     activeExplorerFileIdRef.current = fileId;
+@@ -1103,234 +1183,272 @@ const ExcalidrawWrapper = () => {
+ 
+   return (
+     <div
+-      style={{ height: "100%" }}
++      style={
++        {
++          height: "100%",
++          "--explorer-panel-width": `${explorerPanelWidth}px`,
++        } as React.CSSProperties
++      }
+       className={clsx("excalidraw-app", {
+         "is-collaborating": isCollaborating,
++        "explorer-panel-open": isExplorerPanelOpen,
++        "explorer-panel-overlay": isNarrowViewport,
+       })}
+     >
+-      <Excalidraw
+-        excalidrawAPI={excalidrawRefCallback}
+-        onChange={onChange}
+-        onOpenSceneRequest={handleOpenSceneRequest}
+-        initialData={initialStatePromiseRef.current.promise}
+-        isCollaborating={isCollaborating}
+-        onPointerUpdate={collabAPI?.onPointerUpdate}
+-        UIOptions={{
+-          canvasActions: {
+-            toggleTheme: true,
+-            export: {
+-              onExportToBackend,
+-              renderCustomUI: excalidrawAPI
+-                ? (elements, appState, files) => {
+-                    return (
+-                      <ExportToExcalidrawPlus
+-                        elements={elements}
+-                        appState={appState}
+-                        files={files}
+-                        name={excalidrawAPI.getName()}
+-                        onError={(error) => {
+-                          excalidrawAPI?.updateScene({
+-                            appState: {
+-                              errorMessage: error.message,
+-                            },
+-                          });
+-                        }}
+-                        onSuccess={() => {
+-                          excalidrawAPI.updateScene({
+-                            appState: { openDialog: null },
+-                          });
+-                        }}
+-                      />
+-                    );
+-                  }
+-                : undefined,
+-            },
+-          },
+-        }}
+-        langCode={langCode}
+-        renderCustomStats={renderCustomStats}
+-        detectScroll={false}
+-        handleKeyboardGlobally={true}
+-        autoFocus={true}
+-        theme={theme}
+-        renderTopRightUI={(isMobile) => {
+-          if (isMobile || !collabAPI || isCollabDisabled) {
+-            return null;
+-          }
+-          return (
+-            <div className="top-right-ui">
+-              {collabError.message && <CollabError collabError={collabError} />}
+-              <LiveCollaborationTrigger
+-                isCollaborating={isCollaborating}
+-                onSelect={() =>
+-                  setShareDialogState({ isOpen: true, type: "share" })
+-                }
+-              />
+-            </div>
+-          );
+-        }}
+-      >
+-        <ExplorerPanel
+-          activeFileId={activeExplorerFileId}
+-          activeProjectId={activeExplorerFile?.projectId || null}
+-          refreshToken={explorerPanelRefreshToken}
+-          isCollaborating={isCollaborating}
+-          saveStatus={explorerSaveStatus}
+-          onOpenFile={openExplorerFile}
+-          onActiveFileDeleted={clearActiveExplorerFile}
+-          onActiveFileMetaChange={setActiveExplorerFile}
+-          onError={showExplorerError}
++      <div
++        className="excalidraw-app__explorerSidebar"
++        ref={setExplorerSidebarHost}
++        aria-hidden={!isExplorerPanelOpen}
++      />
++      {isNarrowViewport && isExplorerPanelOpen && (
++        <div
++          className="excalidraw-app__explorerBackdrop"
++          role="presentation"
++          onPointerDown={() => setIsExplorerPanelOpen(false)}
+         />
+-        {isOpenSceneDialogOpen && excalidrawAPI && (
+-          <ExplorerOpenDialog
++      )}
++      <div className="excalidraw-app__canvas">
++        <Excalidraw
++          excalidrawAPI={excalidrawRefCallback}
++          onChange={onChange}
++          onOpenSceneRequest={handleOpenSceneRequest}
++          initialData={initialStatePromiseRef.current.promise}
++          isCollaborating={isCollaborating}
++          onPointerUpdate={collabAPI?.onPointerUpdate}
++          UIOptions={{
++            canvasActions: {
++              toggleTheme: true,
++              export: {
++                onExportToBackend,
++                renderCustomUI: excalidrawAPI
++                  ? (elements, appState, files) => {
++                      return (
++                        <ExportToExcalidrawPlus
++                          elements={elements}
++                          appState={appState}
++                          files={files}
++                          name={excalidrawAPI.getName()}
++                          onError={(error) => {
++                            excalidrawAPI?.updateScene({
++                              appState: {
++                                errorMessage: error.message,
++                              },
++                            });
++                          }}
++                          onSuccess={() => {
++                            excalidrawAPI.updateScene({
++                              appState: { openDialog: null },
++                            });
++                          }}
++                        />
++                      );
++                    }
++                  : undefined,
++              },
++            },
++          }}
++          langCode={langCode}
++          renderCustomStats={renderCustomStats}
++          detectScroll={false}
++          handleKeyboardGlobally={true}
++          autoFocus={true}
++          theme={theme}
++          renderTopRightUI={(isMobile) => {
++            if (isMobile || !collabAPI || isCollabDisabled) {
++              return null;
++            }
++            return (
++              <div className="top-right-ui">
++                {collabError.message && (
++                  <CollabError collabError={collabError} />
++                )}
++                <LiveCollaborationTrigger
++                  isCollaborating={isCollaborating}
++                  onSelect={() =>
++                    setShareDialogState({ isOpen: true, type: "share" })
++                  }
++                />
++              </div>
++            );
++          }}
++        >
++          <ExplorerPanel
+             activeFileId={activeExplorerFileId}
+             activeProjectId={activeExplorerFile?.projectId || null}
+-            excalidrawAPI={excalidrawAPI}
+-            onSelectFile={openExplorerFile}
+-            onBeforeApplyDeviceScene={detachExplorerFileForDeviceScene}
+-            onCloseRequest={() => setIsOpenSceneDialogOpen(false)}
++            refreshToken={explorerPanelRefreshToken}
++            isCollaborating={isCollaborating}
++            saveStatus={explorerSaveStatus}
++            sidebarHost={explorerSidebarHost}
++            isOpen={isExplorerPanelOpen}
++            isDarkTheme={theme === THEME.DARK}
++            width={explorerPanelWidth}
++            onOpenChange={setIsExplorerPanelOpen}
++            onWidthChange={setExplorerPanelWidth}
++            onOpenFile={openExplorerFile}
++            onActiveFileDeleted={clearActiveExplorerFile}
++            onActiveFileMetaChange={setActiveExplorerFile}
+             onError={showExplorerError}
+           />
+-        )}
+-        {isSaveToProjectDialogOpen && excalidrawAPI && (
+-          <ExplorerSaveToProjectDialog
+-            initialFileName={
+-              activeExplorerFile?.name || excalidrawAPI.getName() || "Unbenannt"
++          {isOpenSceneDialogOpen && excalidrawAPI && (
++            <ExplorerOpenDialog
++              activeFileId={activeExplorerFileId}
++              activeProjectId={activeExplorerFile?.projectId || null}
++              excalidrawAPI={excalidrawAPI}
++              onSelectFile={openExplorerFile}
++              onBeforeApplyDeviceScene={detachExplorerFileForDeviceScene}
++              onCloseRequest={() => setIsOpenSceneDialogOpen(false)}
++              onError={showExplorerError}
++            />
++          )}
++          {isSaveToProjectDialogOpen && excalidrawAPI && (
++            <ExplorerSaveToProjectDialog
++              initialFileName={
++                activeExplorerFile?.name ||
++                excalidrawAPI.getName() ||
++                "Unbenannt"
++              }
++              onSave={saveSceneToNewExplorerFile}
++              onCloseRequest={() => setIsSaveToProjectDialogOpen(false)}
++              onError={showExplorerError}
++            />
++          )}
++          <AppMainMenu
++            onCollabDialogOpen={onCollabDialogOpen}
++            isCollaborating={isCollaborating}
++            isCollabEnabled={!isCollabDisabled}
++            activeExplorerFile={activeExplorerFile}
++            onSaveToProject={() => setIsSaveToProjectDialogOpen(true)}
++            isExplorerPanelOpen={isExplorerPanelOpen}
++            onToggleExplorerPanel={() =>
++              setIsExplorerPanelOpen((current) => !current)
+             }
+-            onSave={saveSceneToNewExplorerFile}
+-            onCloseRequest={() => setIsSaveToProjectDialogOpen(false)}
+-            onError={showExplorerError}
+           />
+-        )}
+-        <AppMainMenu
+-          onCollabDialogOpen={onCollabDialogOpen}
+-          isCollaborating={isCollaborating}
+-          isCollabEnabled={!isCollabDisabled}
+-          activeExplorerFile={activeExplorerFile}
+-          onSaveToProject={() => setIsSaveToProjectDialogOpen(true)}
+-        />
+-        <AppWelcomeScreen
+-          onCollabDialogOpen={onCollabDialogOpen}
+-          isCollabEnabled={!isCollabDisabled}
+-        />
+-        <OverwriteConfirmDialog>
+-          <OverwriteConfirmDialog.Actions.ExportToImage />
+-          <OverwriteConfirmDialog.Actions.SaveToDisk />
+-          {excalidrawAPI && (
+-            <OverwriteConfirmDialog.Action
+-              title={t("overwriteConfirm.action.excalidrawPlus.title")}
+-              actionLabel={t("overwriteConfirm.action.excalidrawPlus.button")}
+-              onClick={() => {
+-                exportToExcalidrawPlus(
+-                  excalidrawAPI.getSceneElements(),
+-                  excalidrawAPI.getAppState(),
+-                  excalidrawAPI.getFiles(),
+-                  excalidrawAPI.getName(),
+-                );
+-              }}
+-            >
+-              {t("overwriteConfirm.action.excalidrawPlus.description")}
+-            </OverwriteConfirmDialog.Action>
+-          )}
+-        </OverwriteConfirmDialog>
+-        <AppFooter />
+-        <TTDDialog
+-          onTextSubmit={async (input) => {
+-            try {
+-              const response = await fetch(
+-                `${
+-                  import.meta.env.VITE_APP_AI_BACKEND
+-                }/v1/ai/text-to-diagram/generate`,
+-                {
+-                  method: "POST",
+-                  headers: {
+-                    Accept: "application/json",
+-                    "Content-Type": "application/json",
++          <AppWelcomeScreen
++            onCollabDialogOpen={onCollabDialogOpen}
++            isCollabEnabled={!isCollabDisabled}
++          />
++          <OverwriteConfirmDialog>
++            <OverwriteConfirmDialog.Actions.ExportToImage />
++            <OverwriteConfirmDialog.Actions.SaveToDisk />
++            {excalidrawAPI && (
++              <OverwriteConfirmDialog.Action
++                title={t("overwriteConfirm.action.excalidrawPlus.title")}
++                actionLabel={t("overwriteConfirm.action.excalidrawPlus.button")}
++                onClick={() => {
++                  exportToExcalidrawPlus(
++                    excalidrawAPI.getSceneElements(),
++                    excalidrawAPI.getAppState(),
++                    excalidrawAPI.getFiles(),
++                    excalidrawAPI.getName(),
++                  );
++                }}
++              >
++                {t("overwriteConfirm.action.excalidrawPlus.description")}
++              </OverwriteConfirmDialog.Action>
++            )}
++          </OverwriteConfirmDialog>
++          <AppFooter />
++          <TTDDialog
++            onTextSubmit={async (input) => {
++              try {
++                const response = await fetch(
++                  `${
++                    import.meta.env.VITE_APP_AI_BACKEND
++                  }/v1/ai/text-to-diagram/generate`,
++                  {
++                    method: "POST",
++                    headers: {
++                      Accept: "application/json",
++                      "Content-Type": "application/json",
++                    },
++                    body: JSON.stringify({ prompt: input }),
+                   },
+-                  body: JSON.stringify({ prompt: input }),
+-                },
+-              );
+-
+-              const rateLimit = response.headers.has("X-Ratelimit-Limit")
+-                ? parseInt(response.headers.get("X-Ratelimit-Limit") || "0", 10)
+-                : undefined;
+-
+-              const rateLimitRemaining = response.headers.has(
+-                "X-Ratelimit-Remaining",
+-              )
+-                ? parseInt(
+-                    response.headers.get("X-Ratelimit-Remaining") || "0",
+-                    10,
+-                  )
+-                : undefined;
+-
+-              const json = await response.json();
+-
+-              if (!response.ok) {
+-                if (response.status === 429) {
+-                  return {
+-                    rateLimit,
+-                    rateLimitRemaining,
+-                    error: new Error(
+-                      "Too many requests today, please try again tomorrow!",
+-                    ),
+-                  };
++                );
++
++                const rateLimit = response.headers.has("X-Ratelimit-Limit")
++                  ? parseInt(
++                      response.headers.get("X-Ratelimit-Limit") || "0",
++                      10,
++                    )
++                  : undefined;
++
++                const rateLimitRemaining = response.headers.has(
++                  "X-Ratelimit-Remaining",
++                )
++                  ? parseInt(
++                      response.headers.get("X-Ratelimit-Remaining") || "0",
++                      10,
++                    )
++                  : undefined;
++
++                const json = await response.json();
++
++                if (!response.ok) {
++                  if (response.status === 429) {
++                    return {
++                      rateLimit,
++                      rateLimitRemaining,
++                      error: new Error(
++                        "Too many requests today, please try again tomorrow!",
++                      ),
++                    };
++                  }
++
++                  throw new Error(json.message || "Generation failed...");
+                 }
+ 
+-                throw new Error(json.message || "Generation failed...");
+-              }
++                const generatedResponse = json.generatedResponse;
++                if (!generatedResponse) {
++                  throw new Error("Generation failed...");
++                }
+ 
+-              const generatedResponse = json.generatedResponse;
+-              if (!generatedResponse) {
+-                throw new Error("Generation failed...");
++                return { generatedResponse, rateLimit, rateLimitRemaining };
++              } catch (err: any) {
++                throw new Error("Request failed");
+               }
+-
+-              return { generatedResponse, rateLimit, rateLimitRemaining };
+-            } catch (err: any) {
+-              throw new Error("Request failed");
+-            }
+-          }}
+-        />
+-        <TTDDialogTrigger />
+-        {isCollaborating && isOffline && (
+-          <div className="collab-offline-warning">
+-            {t("alerts.collabOfflineWarning")}
+-          </div>
+-        )}
+-        {latestShareableLink && (
+-          <ShareableLinkDialog
+-            link={latestShareableLink}
+-            onCloseRequest={() => setLatestShareableLink(null)}
+-            setErrorMessage={setErrorMessage}
++            }}
+           />
+-        )}
+-        {excalidrawAPI && !isCollabDisabled && (
+-          <Collab excalidrawAPI={excalidrawAPI} />
+-        )}
+-
+-        <ShareDialog
+-          collabAPI={collabAPI}
+-          onExportToBackend={async () => {
+-            if (excalidrawAPI) {
+-              try {
+-                await onExportToBackend(
+-                  excalidrawAPI.getSceneElements(),
+-                  excalidrawAPI.getAppState(),
+-                  excalidrawAPI.getFiles(),
+-                );
+-              } catch (error: any) {
+-                setErrorMessage(error.message);
++          <TTDDialogTrigger />
++          {isCollaborating && isOffline && (
++            <div className="collab-offline-warning">
++              {t("alerts.collabOfflineWarning")}
++            </div>
++          )}
++          {latestShareableLink && (
++            <ShareableLinkDialog
++              link={latestShareableLink}
++              onCloseRequest={() => setLatestShareableLink(null)}
++              setErrorMessage={setErrorMessage}
++            />
++          )}
++          {excalidrawAPI && !isCollabDisabled && (
++            <Collab excalidrawAPI={excalidrawAPI} />
++          )}
++
++          <ShareDialog
++            collabAPI={collabAPI}
++            onExportToBackend={async () => {
++              if (excalidrawAPI) {
++                try {
++                  await onExportToBackend(
++                    excalidrawAPI.getSceneElements(),
++                    excalidrawAPI.getAppState(),
++                    excalidrawAPI.getFiles(),
++                  );
++                } catch (error: any) {
++                  setErrorMessage(error.message);
++                }
+               }
+-            }
+-          }}
+-        />
++            }}
++          />
+ 
+-        {errorMessage && (
+-          <ErrorDialog onClose={() => setErrorMessage("")}>
+-            {errorMessage}
+-          </ErrorDialog>
+-        )}
+-      </Excalidraw>
++          {errorMessage && (
++            <ErrorDialog onClose={() => setErrorMessage("")}>
++              {errorMessage}
++            </ErrorDialog>
++          )}
++        </Excalidraw>
++      </div>
+     </div>
+   );
+ };
+diff --git a/excalidraw-app/components/AppMainMenu.tsx b/excalidraw-app/components/AppMainMenu.tsx
+index 69f3491..2c23a40 100644
+--- a/excalidraw-app/components/AppMainMenu.tsx
++++ b/excalidraw-app/components/AppMainMenu.tsx
+@@ -5,6 +5,7 @@ import {
+ } from "../../packages/excalidraw/components/icons";
+ import { MainMenu } from "../../packages/excalidraw/index";
+ import type { ExplorerFileMeta } from "../data/explorer";
++import { ExplorerSidebarIcon } from "./explorer/ExplorerIcons";
+ import { LanguageList } from "./LanguageList";
+ 
+ export const AppMainMenu: React.FC<{
+@@ -13,9 +14,21 @@ export const AppMainMenu: React.FC<{
+   isCollabEnabled: boolean;
+   activeExplorerFile: ExplorerFileMeta | null;
+   onSaveToProject: () => void;
++  isExplorerPanelOpen: boolean;
++  onToggleExplorerPanel: () => void;
+ }> = React.memo((props) => {
+   return (
+     <MainMenu>
++      <MainMenu.Item
++        icon={<ExplorerSidebarIcon />}
++        onSelect={props.onToggleExplorerPanel}
++        shortcut="Alt+F"
++      >
++        {props.isExplorerPanelOpen
++          ? "Files-Sidebar ausblenden"
++          : "Files-Sidebar einblenden"}
++      </MainMenu.Item>
++      <MainMenu.Separator />
+       <MainMenu.DefaultItems.LoadScene />
+       <MainMenu.DefaultItems.SaveToActiveFile />
+       <MainMenu.Item icon={saveAs} onSelect={props.onSaveToProject}>
+diff --git a/excalidraw-app/components/explorer/ExplorerDialogs.scss b/excalidraw-app/components/explorer/ExplorerDialogs.scss
+index 7215e81..ba78cd1 100644
+--- a/excalidraw-app/components/explorer/ExplorerDialogs.scss
++++ b/excalidraw-app/components/explorer/ExplorerDialogs.scss
+@@ -91,9 +91,17 @@
+   }
+ 
+   .ExplorerOpenDialog__chevron {
+-    width: 0.65rem;
++    display: flex;
++    flex: 0 0 auto;
++    align-items: center;
++    justify-content: center;
++    width: 0.85rem;
+     color: var(--color-muted-darker);
+-    text-align: center;
++    transition: transform 0.12s ease-in-out;
++
++    &.is-expanded {
++      transform: rotate(90deg);
++    }
+   }
+ 
+   .ExplorerOpenDialog__name {
+diff --git a/excalidraw-app/components/explorer/ExplorerIcons.tsx b/excalidraw-app/components/explorer/ExplorerIcons.tsx
+new file mode 100644
+index 0000000..7a0262d
+--- /dev/null
++++ b/excalidraw-app/components/explorer/ExplorerIcons.tsx
+@@ -0,0 +1,61 @@
++/**
++ * Kleine Inline-Icons für den Datei-Explorer. Bewusst lokal gehalten (statt
++ * packages/excalidraw/components/icons.tsx zu erweitern), damit der Fork-Diff
++ * gegen Upstream klein bleibt. Strichstärke/Größe folgen dem Excalidraw-Stil.
++ */
++const iconProps = {
++  width: 16,
++  height: 16,
++  viewBox: "0 0 24 24",
++  fill: "none",
++  stroke: "currentColor",
++  strokeWidth: 1.75,
++  strokeLinecap: "round",
++  strokeLinejoin: "round",
++  "aria-hidden": true,
++  focusable: false,
++} as const;
++
++export const ExplorerSidebarIcon = () => (
++  <svg {...iconProps}>
++    <rect x="3" y="4" width="18" height="16" rx="2" />
++    <path d="M10 4v16" />
++  </svg>
++);
++
++export const ExplorerProjectIcon = () => (
++  <svg {...iconProps}>
++    <path d="M3 7a2 2 0 0 1 2-2h3.6a2 2 0 0 1 1.6.8l.8 1.2H19a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z" />
++  </svg>
++);
++
++export const ExplorerDrawingIcon = () => (
++  <svg {...iconProps}>
++    <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5Z" />
++    <path d="M14 3v5h5" />
++  </svg>
++);
++
++export const ExplorerChevronIcon = () => (
++  <svg {...iconProps} width={12} height={12}>
++    <path d="M9 6l6 6-6 6" />
++  </svg>
++);
++
++export const ExplorerPlusIcon = () => (
++  <svg {...iconProps}>
++    <path d="M12 5v14M5 12h14" />
++  </svg>
++);
++
++export const ExplorerCloseIcon = () => (
++  <svg {...iconProps}>
++    <path d="M15 5l-7 7 7 7" />
++  </svg>
++);
++
++export const ExplorerMoreIcon = () => (
++  <svg {...iconProps} strokeWidth={2.25}>
++    <path d="M12 6h.01M12 12h.01M12 18h.01" />
++  </svg>
++);
+diff --git a/excalidraw-app/components/explorer/ExplorerOpenDialog.tsx b/excalidraw-app/components/explorer/ExplorerOpenDialog.tsx
+index 64ad4a2..7916929 100644
+--- a/excalidraw-app/components/explorer/ExplorerOpenDialog.tsx
++++ b/excalidraw-app/components/explorer/ExplorerOpenDialog.tsx
+@@ -11,6 +11,11 @@ import {
+   explorerApi,
+   getExplorerErrorMessage,
+ } from "../../data/explorer";
++import {
++  ExplorerChevronIcon,
++  ExplorerDrawingIcon,
++  ExplorerProjectIcon,
++} from "./ExplorerIcons";
+ 
+ import "./ExplorerDialogs.scss";
+ 
+@@ -206,10 +211,14 @@ export const ExplorerOpenDialog = ({
+                   aria-expanded={isExpanded}
+                   onClick={() => toggleProject(project.id)}
+                 >
+-                  <span className="ExplorerOpenDialog__chevron" aria-hidden>
+-                    {isExpanded ? "▾" : "▸"}
++                  <span
++                    className={clsx("ExplorerOpenDialog__chevron", {
++                      "is-expanded": isExpanded,
++                    })}
++                  >
++                    <ExplorerChevronIcon />
+                   </span>
+-                  <span aria-hidden>▰</span>
++                  <ExplorerProjectIcon />
+                   <span className="ExplorerOpenDialog__name">
+                     {project.name}
+                   </span>
+@@ -241,7 +250,7 @@ export const ExplorerOpenDialog = ({
+                           )}
+                           onClick={() => void openExplorerFile(file.id)}
+                         >
+-                          <span aria-hidden>◇</span>
++                          <ExplorerDrawingIcon />
+                           <span className="ExplorerOpenDialog__name">
+                             {file.name}
+                           </span>
+diff --git a/excalidraw-app/components/explorer/ExplorerPanel.scss b/excalidraw-app/components/explorer/ExplorerPanel.scss
+index d941e44..defeab9 100644
+--- a/excalidraw-app/components/explorer/ExplorerPanel.scss
++++ b/excalidraw-app/components/explorer/ExplorerPanel.scss
+@@ -1,3 +1,24 @@
++// Wurzel der per Portal in die App-Spalte gerenderten Sidebar. Trägt selbst die
++// Klasse `excalidraw`, damit Theme-Variablen greifen; die doppelte Klasse hier
++// überschreibt zuverlässig die 100%-Flex-Regeln des Excalidraw-Containers.
++.excalidraw.ExplorerSidebarRoot {
++  position: relative;
++  display: flex;
++  width: 100%;
++  height: 100%;
++  overflow: hidden;
++  // Deckend: unter der Sidebar darf weder Canvas noch Seitenhintergrund
++  // durchscheinen.
++  background-color: var(--sidebar-bg-color);
++  // Eigener Stacking-Kontext, damit interne z-indizes lokal bleiben.
++  isolation: isolate;
++
++  &.is-resizing {
++    cursor: col-resize;
++    user-select: none;
++  }
++}
++
+ .excalidraw {
+   .ExplorerToggle {
+     position: absolute;
+@@ -8,74 +29,101 @@
+     align-items: center;
+     gap: 0.4rem;
+     height: var(--lg-button-size);
+-    padding: 0 0.7rem;
++    padding: 0 0.75rem;
+     border: 0;
+     border-radius: var(--border-radius-lg);
+-    box-shadow: 0 0 0 1px var(--color-surface-lowest);
+-    background: var(--color-surface-mid);
++    background: var(--island-bg-color);
++    box-shadow: var(--shadow-island);
+     color: var(--color-on-surface);
+     font: inherit;
+     font-size: 0.75rem;
+-    font-weight: 600;
++    font-weight: 500;
++
++    svg {
++      width: 1rem;
++      height: 1rem;
++    }
+ 
+     &:hover {
++      background: var(--button-hover-bg, var(--color-surface-high));
++    }
++
++    &:active {
+       background: var(--color-surface-high);
+     }
+   }
+ 
+   .ExplorerPanel {
+-    position: absolute;
+-    // 3 = über dem interaktiven Canvas, aber unter .layer-ui__wrapper
+-    // (--zIndex-layerUI: 4), in dem das Hauptmenü-Dropdown lebt — so bleibt
+-    // das Hauptmenü bei geöffnetem Panel bedienbar. Empirisch verifiziert:
+-    // bei 1–2 fängt der Canvas die Panel-Klicks ab.
+-    z-index: 3;
+-    top: calc(
+-      var(--editor-container-padding) + var(--sat, 0px) + var(--lg-button-size) +
+-        0.75rem
+-    );
+-    bottom: 0;
+-    left: 0;
++    position: relative;
++    z-index: 0;
+     display: flex;
++    flex: 1 1 auto;
+     flex-direction: column;
+-    width: min(19rem, calc(100% - 1rem));
++    min-width: 0;
++    height: 100%;
+     box-sizing: border-box;
+     border-right: 1px solid var(--sidebar-border-color);
+     background: var(--sidebar-bg-color);
+     color: var(--color-on-surface);
+-    box-shadow: 0.25rem 0 1.25rem rgb(0 0 0 / 12%);
++  }
++
++  .ExplorerPanel__resizer {
++    position: absolute;
++    z-index: 1;
++    top: 0;
++    right: 0;
++    bottom: 0;
++    width: 0.4rem;
++    background: transparent;
++    cursor: col-resize;
++
++    &:hover,
++    &:focus-visible {
++      background: var(--color-primary);
++      opacity: 0.35;
++      outline: none;
++    }
+   }
+ 
+   .ExplorerPanel__header {
+     display: flex;
+     align-items: flex-start;
+     justify-content: space-between;
+-    gap: 0.75rem;
+-    min-height: 4.35rem;
+-    padding: 0.85rem 0.8rem 0.75rem;
++    gap: 0.5rem;
++    min-height: 3.9rem;
++    padding: 0.7rem 0.6rem 0.6rem 0.85rem;
+     box-sizing: border-box;
+     border-bottom: 1px solid var(--sidebar-border-color);
+ 
+     h2 {
+-      margin: 0 0 0.3rem;
+-      font-size: 1rem;
++      margin: 0 0 0.25rem;
++      font-size: 0.9rem;
++      font-weight: 600;
++      letter-spacing: 0.01em;
+       line-height: 1.25;
+     }
+   }
+ 
++  .ExplorerPanel__headerTitle {
++    min-width: 0;
++  }
++
+   .ExplorerPanel__headerActions {
+     display: flex;
+-    gap: 0.25rem;
++    flex: 0 0 auto;
++    gap: 0.15rem;
+ 
+     button {
+-      width: 2rem;
+-      height: 2rem;
++      display: flex;
++      align-items: center;
++      justify-content: center;
++      width: 1.9rem;
++      height: 1.9rem;
+       padding: 0;
+       border: 0;
+       border-radius: var(--border-radius-md);
+       background: transparent;
+       color: var(--color-on-surface);
+-      font-size: 1.25rem;
+ 
+       &:hover {
+         background: var(--color-surface-high);
+@@ -183,9 +231,29 @@
+   }
+ 
+   .ExplorerPanel__chevron {
+-    width: 0.65rem;
++    display: flex;
++    flex: 0 0 auto;
++    align-items: center;
++    justify-content: center;
++    width: 0.85rem;
+     color: var(--color-muted-darker);
+-    text-align: center;
++    transition: transform 0.12s ease-in-out;
++
++    &.is-expanded {
++      transform: rotate(90deg);
++    }
++  }
++
++  .ExplorerPanel__icon {
++    display: flex;
++    flex: 0 0 auto;
++    align-items: center;
++    justify-content: center;
++    color: var(--color-muted-darker);
++  }
++
++  .ExplorerPanel__row.active .ExplorerPanel__icon {
++    color: inherit;
+   }
+ 
+   .ExplorerPanel__name {
+@@ -195,16 +263,19 @@
+   }
+ 
+   .ExplorerPanel__more {
++    display: flex;
+     flex: 0 0 auto;
+-    width: 1.8rem;
+-    height: 1.8rem;
++    align-items: center;
++    justify-content: center;
++    width: 1.7rem;
++    height: 1.7rem;
++    margin-right: 0.15rem;
+     padding: 0;
+     border: 0;
+     border-radius: var(--border-radius-md);
+     opacity: 0;
+     background: transparent;
+     color: inherit;
+-    font-size: 1rem;
+ 
+     &:focus-visible {
+       opacity: 1;
+diff --git a/excalidraw-app/components/explorer/ExplorerPanel.tsx b/excalidraw-app/components/explorer/ExplorerPanel.tsx
+index 4ee79e7..3bd53f4 100644
+--- a/excalidraw-app/components/explorer/ExplorerPanel.tsx
++++ b/excalidraw-app/components/explorer/ExplorerPanel.tsx
+@@ -1,15 +1,27 @@
+ import React, { useCallback, useEffect, useRef, useState } from "react";
++import { createPortal } from "react-dom";
+ import clsx from "clsx";
+ 
+ import {
+-  EXPLORER_PANEL_OPEN_KEY,
++  EXPLORER_PANEL_MAX_WIDTH,
++  EXPLORER_PANEL_MIN_WIDTH,
+   ExplorerFileMeta,
+   ExplorerProject,
++  clampExplorerPanelWidth,
+   explorerApi,
+   getExplorerErrorMessage,
+ } from "../../data/explorer";
+ import { ExplorerDeleteConfirmDialog } from "./ExplorerDeleteConfirmDialog";
+ import { ExplorerNameDialog } from "./ExplorerNameDialog";
++import {
++  ExplorerChevronIcon,
++  ExplorerCloseIcon,
++  ExplorerDrawingIcon,
++  ExplorerMoreIcon,
++  ExplorerPlusIcon,
++  ExplorerProjectIcon,
++  ExplorerSidebarIcon,
++} from "./ExplorerIcons";
+ 
+ import "./ExplorerPanel.scss";
+ 
+@@ -40,6 +52,13 @@ type ExplorerPanelProps = {
+   refreshToken: number;
+   isCollaborating: boolean;
+   saveStatus: ExplorerSaveStatus;
++  /** Sidebar-Spalte im App-Layout; das Panel wird per Portal dorthin gerendert. */
++  sidebarHost: HTMLElement | null;
++  isOpen: boolean;
++  isDarkTheme: boolean;
++  width: number;
++  onOpenChange: (isOpen: boolean) => void;
++  onWidthChange: (width: number) => void;
+   onOpenFile: (fileId: string) => Promise<void>;
+   onActiveFileDeleted: () => void;
+   onActiveFileMetaChange: (file: ExplorerFileMeta) => void;
+@@ -68,14 +87,17 @@ export const ExplorerPanel = ({
+   refreshToken,
+   isCollaborating,
+   saveStatus,
++  sidebarHost,
++  isOpen,
++  isDarkTheme,
++  width,
++  onOpenChange,
++  onWidthChange,
+   onOpenFile,
+   onActiveFileDeleted,
+   onActiveFileMetaChange,
+   onError,
+ }: ExplorerPanelProps) => {
+-  const [isOpen, setIsOpen] = useState(
+-    () => localStorage.getItem(EXPLORER_PANEL_OPEN_KEY) === "true",
+-  );
+   const [projects, setProjects] = useState<ExplorerProject[]>([]);
+   const [filesByProject, setFilesByProject] = useState<
+     Record<string, ExplorerFileMeta[]>
+@@ -98,6 +120,7 @@ export const ExplorerPanel = ({
+   const [dragOverProjectId, setDragOverProjectId] = useState<string | null>(
+     null,
+   );
++  const [isResizing, setIsResizing] = useState(false);
+   const draggedFileRef = useRef<ExplorerFileMeta | null>(null);
+   const suppressFileClickRef = useRef(false);
+   const previousRefreshTokenRef = useRef(refreshToken);
+@@ -144,7 +167,6 @@ export const ExplorerPanel = ({
+   );
+ 
+   useEffect(() => {
+-    localStorage.setItem(EXPLORER_PANEL_OPEN_KEY, String(isOpen));
+     if (isOpen && !loadingProjects && !hasLoadedProjects && !error) {
+       void loadProjects();
+     }
+@@ -517,6 +539,44 @@ export const ExplorerPanel = ({
+     setContextMenu({ ...target, x: event.clientX, y: event.clientY });
+   };
+ 
++  const handleResizeStart = (event: React.PointerEvent<HTMLDivElement>) => {
++    if (event.button !== 0) {
++      return;
++    }
++    event.preventDefault();
++
++    const startX = event.clientX;
++    const startWidth = width;
++    setIsResizing(true);
++
++    const handleMove = (moveEvent: PointerEvent) => {
++      onWidthChange(
++        clampExplorerPanelWidth(startWidth + moveEvent.clientX - startX),
++      );
++    };
++    const handleEnd = () => {
++      setIsResizing(false);
++      window.removeEventListener("pointermove", handleMove);
++      window.removeEventListener("pointerup", handleEnd);
++      window.removeEventListener("pointercancel", handleEnd);
++    };
++
++    window.addEventListener("pointermove", handleMove);
++    window.addEventListener("pointerup", handleEnd);
++    window.addEventListener("pointercancel", handleEnd);
++  };
++
++  const handleResizeKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
++    const step = event.shiftKey ? 48 : 16;
++    if (event.key === "ArrowLeft") {
++      event.preventDefault();
++      onWidthChange(clampExplorerPanelWidth(width - step));
++    } else if (event.key === "ArrowRight") {
++      event.preventDefault();
++      onWidthChange(clampExplorerPanelWidth(width + step));
++    }
++  };
++
+   const saveLabel = isCollaborating
+     ? "Autosave während Zusammenarbeit deaktiviert"
+     : saveStatus === "saving"
+@@ -529,145 +589,201 @@ export const ExplorerPanel = ({
+     ? "Gespeichert"
+     : "Keine Datei geöffnet";
+ 
+-  return (
+-    <>
+-      {!isOpen && (
+-        <button
+-          className="ExplorerToggle"
+-          type="button"
+-          title="Files öffnen"
+-          aria-label="Files öffnen"
+-          onClick={() => setIsOpen(true)}
+-        >
+-          <span aria-hidden="true">☰</span>
+-          <span>Files</span>
+-        </button>
+-      )}
++  // Die Sidebar wird per Portal in die App-Spalte gerendert (außerhalb des
++  // Excalidraw-Containers), deshalb trägt der Wrapper selbst `excalidraw` +
++  // Theme-Klasse: nur so greifen die Excalidraw-CSS-Variablen.
++  const sidebar = (
++    <div
++      className={clsx("excalidraw", "ExplorerSidebarRoot", {
++        "theme--dark": isDarkTheme,
++        "is-resizing": isResizing,
++      })}
++    >
++      <aside className="ExplorerPanel" aria-label="Files Explorer">
++        <header className="ExplorerPanel__header">
++          <div className="ExplorerPanel__headerTitle">
++            <h2>Files</h2>
++            <div className="ExplorerPanel__saveStatus" role="status">
++              <span
++                className={clsx("ExplorerPanel__statusDot", {
++                  "is-saving": saveStatus === "saving",
++                  "is-error": saveStatus === "error",
++                  "is-disabled": isCollaborating,
++                })}
++              />
++              {saveLabel}
++            </div>
++          </div>
++          <div className="ExplorerPanel__headerActions">
++            <button
++              type="button"
++              title="Neues Projekt"
++              aria-label="Neues Projekt"
++              onClick={() => openNameDialog({ kind: "createProject" })}
++            >
++              <ExplorerPlusIcon />
++            </button>
++            <button
++              type="button"
++              title="Sidebar ausblenden"
++              aria-label="Sidebar ausblenden"
++              onClick={() => onOpenChange(false)}
++            >
++              <ExplorerCloseIcon />
++            </button>
++          </div>
++        </header>
++
++        {error && (
++          <div className="ExplorerPanel__error">
++            <span>{error}</span>
++            <button type="button" onClick={loadProjects}>
++              Erneut versuchen
++            </button>
++          </div>
++        )}
+ 
+-      {isOpen && (
+-        <aside className="ExplorerPanel" aria-label="Files Explorer">
+-          <header className="ExplorerPanel__header">
+-            <div>
+-              <h2>Files</h2>
+-              <div className="ExplorerPanel__saveStatus" role="status">
+-                <span
+-                  className={clsx("ExplorerPanel__statusDot", {
+-                    "is-saving": saveStatus === "saving",
+-                    "is-error": saveStatus === "error",
+-                    "is-disabled": isCollaborating,
+-                  })}
+-                />
+-                {saveLabel}
+-              </div>
++        <div className="ExplorerPanel__tree">
++          {loadingProjects && projects.length === 0 ? (
++            <div className="ExplorerPanel__message">
++              Projekte werden geladen…
+             </div>
+-            <div className="ExplorerPanel__headerActions">
++          ) : projects.length === 0 && !error ? (
++            <div className="ExplorerPanel__empty">
++              <p>
++                Noch keine Projekte. Lege ein Projekt für deine Zeichnungen an.
++              </p>
+               <button
+                 type="button"
+-                title="Neues Projekt"
+                 onClick={() => openNameDialog({ kind: "createProject" })}
+               >
+-                +
+-              </button>
+-              <button
+-                type="button"
+-                title="Files schließen"
+-                aria-label="Files schließen"
+-                onClick={() => setIsOpen(false)}
+-              >
+-                ×
++                Neues Projekt
+               </button>
+             </div>
+-          </header>
+-
+-          {error && (
+-            <div className="ExplorerPanel__error">
+-              <span>{error}</span>
+-              <button type="button" onClick={loadProjects}>
+-                Erneut versuchen
+-              </button>
+-            </div>
+-          )}
+-
+-          <div className="ExplorerPanel__tree">
+-            {loadingProjects && projects.length === 0 ? (
+-              <div className="ExplorerPanel__message">
+-                Projekte werden geladen…
+-              </div>
+-            ) : projects.length === 0 && !error ? (
+-              <div className="ExplorerPanel__empty">
+-                <p>
+-                  Noch keine Projekte. Lege ein Projekt für deine Zeichnungen
+-                  an.
+-                </p>
+-                <button
+-                  type="button"
+-                  onClick={() => openNameDialog({ kind: "createProject" })}
+-                >
+-                  Neues Projekt
+-                </button>
+-              </div>
+-            ) : (
+-              projects.map((project) => {
+-                const isExpanded = expandedProjects.has(project.id);
+-                const files = filesByProject[project.id] || [];
+-                return (
+-                  <section className="ExplorerPanel__project" key={project.id}>
+-                    <div
+-                      className={clsx(
+-                        "ExplorerPanel__row",
+-                        "ExplorerPanel__projectRow",
+-                        {
+-                          "is-drop-target": dragOverProjectId === project.id,
+-                        },
+-                      )}
+-                      data-project-id={project.id}
+-                      onDragOver={(event) =>
+-                        handleProjectDragOver(event, project.id)
+-                      }
+-                      onDragLeave={(event) =>
+-                        handleProjectDragLeave(event, project.id)
+-                      }
+-                      onDrop={(event) => handleProjectDrop(event, project.id)}
+-                      onContextMenu={(event) =>
++          ) : (
++            projects.map((project) => {
++              const isExpanded = expandedProjects.has(project.id);
++              const files = filesByProject[project.id] || [];
++              return (
++                <section className="ExplorerPanel__project" key={project.id}>
++                  <div
++                    className={clsx(
++                      "ExplorerPanel__row",
++                      "ExplorerPanel__projectRow",
++                      {
++                        "is-drop-target": dragOverProjectId === project.id,
++                      },
++                    )}
++                    data-project-id={project.id}
++                    onDragOver={(event) =>
++                      handleProjectDragOver(event, project.id)
++                    }
++                    onDragLeave={(event) =>
++                      handleProjectDragLeave(event, project.id)
++                    }
++                    onDrop={(event) => handleProjectDrop(event, project.id)}
++                    onContextMenu={(event) =>
++                      openContextMenu(event, { kind: "project", project })
++                    }
++                  >
++                    <button
++                      className="ExplorerPanel__rowMain"
++                      type="button"
++                      aria-expanded={isExpanded}
++                      onClick={() => toggleProject(project.id)}
++                    >
++                      <span
++                        className={clsx("ExplorerPanel__chevron", {
++                          "is-expanded": isExpanded,
++                        })}
++                      >
++                        <ExplorerChevronIcon />
++                      </span>
++                      <span className="ExplorerPanel__icon">
++                        <ExplorerProjectIcon />
++                      </span>
++                      <span className="ExplorerPanel__name">
++                        {project.name}
++                      </span>
++                    </button>
++                    <button
++                      className="ExplorerPanel__more"
++                      type="button"
++                      aria-label={`Aktionen für ${project.name}`}
++                      onClick={(event) =>
+                         openContextMenu(event, { kind: "project", project })
+                       }
+                     >
+-                      <button
+-                        className="ExplorerPanel__rowMain"
+-                        type="button"
+-                        aria-expanded={isExpanded}
+-                        onClick={() => toggleProject(project.id)}
+-                      >
+-                        <span
+-                          className="ExplorerPanel__chevron"
+-                          aria-hidden="true"
++                      <ExplorerMoreIcon />
++                    </button>
++                  </div>
++
++                  {isExpanded && (
++                    <div className="ExplorerPanel__files">
++                      {loadingFileProjects.has(project.id) ? (
++                        <div className="ExplorerPanel__message">
++                          Dateien werden geladen…
++                        </div>
++                      ) : files.length === 0 ? (
++                        <button
++                          className="ExplorerPanel__newFile"
++                          type="button"
++                          onClick={() =>
++                            openNameDialog({ kind: "createFile", project })
++                          }
+                         >
+-                          {isExpanded ? "▾" : "▸"}
+-                        </span>
+-                        <span aria-hidden="true">▰</span>
+-                        <span className="ExplorerPanel__name">
+-                          {project.name}
+-                        </span>
+-                      </button>
+-                      <button
+-                        className="ExplorerPanel__more"
+-                        type="button"
+-                        aria-label={`Aktionen für ${project.name}`}
+-                        onClick={(event) =>
+-                          openContextMenu(event, { kind: "project", project })
+-                        }
+-                      >
+-                        ⋮
+-                      </button>
+-                    </div>
+-
+-                    {isExpanded && (
+-                      <div className="ExplorerPanel__files">
+-                        {loadingFileProjects.has(project.id) ? (
+-                          <div className="ExplorerPanel__message">
+-                            Dateien werden geladen…
+-                          </div>
+-                        ) : files.length === 0 ? (
++                          + Neue Zeichnung
++                        </button>
++                      ) : (
++                        <>
++                          {files.map((file) => (
++                            <div
++                              className={clsx(
++                                "ExplorerPanel__row",
++                                "ExplorerPanel__fileRow",
++                                {
++                                  active: file.id === activeFileId,
++                                  "is-dragging": file.id === draggedFileId,
++                                },
++                              )}
++                              key={file.id}
++                              data-file-id={file.id}
++                              draggable
++                              onDragStart={(event) =>
++                                handleFileDragStart(event, file)
++                              }
++                              onDragEnd={handleFileDragEnd}
++                              onContextMenu={(event) =>
++                                openContextMenu(event, { kind: "file", file })
++                              }
++                            >
++                              <button
++                                className="ExplorerPanel__rowMain"
++                                type="button"
++                                onClick={() => handleFileClick(file.id)}
++                              >
++                                <span className="ExplorerPanel__icon">
++                                  <ExplorerDrawingIcon />
++                                </span>
++                                <span className="ExplorerPanel__name">
++                                  {file.name}
++                                </span>
++                              </button>
++                              <button
++                                className="ExplorerPanel__more"
++                                type="button"
++                                aria-label={`Aktionen für ${file.name}`}
++                                onClick={(event) =>
++                                  openContextMenu(event, {
++                                    kind: "file",
++                                    file,
++                                  })
++                                }
++                              >
++                                <ExplorerMoreIcon />
++                              </button>
++                            </div>
++                          ))}
+                           <button
+                             className="ExplorerPanel__newFile"
+                             type="button"
+@@ -677,75 +793,49 @@ export const ExplorerPanel = ({
+                           >
+                             + Neue Zeichnung
+                           </button>
+-                        ) : (
+-                          <>
+-                            {files.map((file) => (
+-                              <div
+-                                className={clsx(
+-                                  "ExplorerPanel__row",
+-                                  "ExplorerPanel__fileRow",
+-                                  {
+-                                    active: file.id === activeFileId,
+-                                    "is-dragging": file.id === draggedFileId,
+-                                  },
+-                                )}
+-                                key={file.id}
+-                                data-file-id={file.id}
+-                                draggable
+-                                onDragStart={(event) =>
+-                                  handleFileDragStart(event, file)
+-                                }
+-                                onDragEnd={handleFileDragEnd}
+-                                onContextMenu={(event) =>
+-                                  openContextMenu(event, { kind: "file", file })
+-                                }
+-                              >
+-                                <button
+-                                  className="ExplorerPanel__rowMain"
+-                                  type="button"
+-                                  onClick={() => handleFileClick(file.id)}
+-                                >
+-                                  <span aria-hidden="true">◇</span>
+-                                  <span className="ExplorerPanel__name">
+-                                    {file.name}
+-                                  </span>
+-                                </button>
+-                                <button
+-                                  className="ExplorerPanel__more"
+-                                  type="button"
+-                                  aria-label={`Aktionen für ${file.name}`}
+-                                  onClick={(event) =>
+-                                    openContextMenu(event, {
+-                                      kind: "file",
+-                                      file,
+-                                    })
+-                                  }
+-                                >
+-                                  ⋮
+-                                </button>
+-                              </div>
+-                            ))}
+-                            <button
+-                              className="ExplorerPanel__newFile"
+-                              type="button"
+-                              onClick={() =>
+-                                openNameDialog({ kind: "createFile", project })
+-                              }
+-                            >
+-                              + Neue Zeichnung
+-                            </button>
+-                          </>
+-                        )}
+-                      </div>
+-                    )}
+-                  </section>
+-                );
+-              })
+-            )}
+-          </div>
+-        </aside>
++                        </>
++                      )}
++                    </div>
++                  )}
++                </section>
++              );
++            })
++          )}
++        </div>
++      </aside>
++
++      <div
++        className="ExplorerPanel__resizer"
++        role="separator"
++        aria-orientation="vertical"
++        aria-label="Breite der Files-Sidebar ändern"
++        aria-valuenow={width}
++        aria-valuemin={EXPLORER_PANEL_MIN_WIDTH}
++        aria-valuemax={EXPLORER_PANEL_MAX_WIDTH}
++        tabIndex={0}
++        onPointerDown={handleResizeStart}
++        onKeyDown={handleResizeKeyDown}
++      />
++    </div>
++  );
++
++  return (
++    <>
++      {!isOpen && (
++        <button
++          className="ExplorerToggle"
++          type="button"
++          title="Files einblenden"
++          aria-label="Files einblenden"
++          onClick={() => onOpenChange(true)}
++        >
++          <ExplorerSidebarIcon />
++          <span>Files</span>
++        </button>
+       )}
+ 
++      {isOpen && sidebarHost && createPortal(sidebar, sidebarHost)}
++
+       {contextMenu && (
+         <div
+           className="ExplorerContextMenu"
+diff --git a/excalidraw-app/data/explorer.ts b/excalidraw-app/data/explorer.ts
+index fd2b326..e3f36a7 100644
+--- a/excalidraw-app/data/explorer.ts
++++ b/excalidraw-app/data/explorer.ts
+@@ -5,6 +5,33 @@ import { serializeAsJSON } from "../../packages/excalidraw/data/json";
+ 
+ export const EXPLORER_CURRENT_FILE_KEY = "explorer:currentFileId";
+ export const EXPLORER_PANEL_OPEN_KEY = "explorer:panelOpen";
++export const EXPLORER_PANEL_WIDTH_KEY = "explorer:panelWidth";
++
++export const EXPLORER_PANEL_DEFAULT_WIDTH = 280;
++export const EXPLORER_PANEL_MIN_WIDTH = 200;
++export const EXPLORER_PANEL_MAX_WIDTH = 520;
++
++// Unterhalb dieser Breite (Excalidraws MQ_MAX_WIDTH_PORTRAIT) überlagert die
++// Sidebar den Canvas, statt ihn zu verschmälern — sonst bliebe zu wenig
++// Zeichenfläche übrig.
++export const EXPLORER_PANEL_OVERLAY_BREAKPOINT = 730;
++
++export const clampExplorerPanelWidth = (width: number) =>
++  Math.min(
++    EXPLORER_PANEL_MAX_WIDTH,
++    Math.max(EXPLORER_PANEL_MIN_WIDTH, Math.round(width)),
++  );
++
++/** Sidebar ist standardmäßig sichtbar; nur eine explizite Wahl blendet sie aus. */
++export const readExplorerPanelOpen = () =>
++  localStorage.getItem(EXPLORER_PANEL_OPEN_KEY) !== "false";
++
++export const readExplorerPanelWidth = () => {
++  const stored = Number(localStorage.getItem(EXPLORER_PANEL_WIDTH_KEY));
++  return Number.isFinite(stored) && stored > 0
++    ? clampExplorerPanelWidth(stored)
++    : EXPLORER_PANEL_DEFAULT_WIDTH;
++};
+ 
+ export type ExplorerProject = {
+   id: string;
+diff --git a/excalidraw-app/index.scss b/excalidraw-app/index.scss
+index 24741b0..aebd1e9 100644
+--- a/excalidraw-app/index.scss
++++ b/excalidraw-app/index.scss
+@@ -77,6 +77,92 @@
+   }
+ }
+ 
++// Layout: Files-Sidebar als eigene Spalte links, Excalidraw daneben. Der Canvas
++// liegt dadurch nie unter der Sidebar — kein Überlappen, kein Durchscheinen.
++.excalidraw-app {
++  display: flex;
++  align-items: stretch;
++  width: 100%;
++  overflow: hidden;
++  // Eigener Stacking-Kontext: die Sidebar konkurriert nicht mit
++  // Excalidraw-internen z-indizes.
++  isolation: isolate;
++
++  &__explorerSidebar {
++    position: relative;
++    // Über der Excalidraw-UI (--zIndex-layerUI: 4), aber unter Dialogen
++    // (--zIndex-modal: 1000) — die sollen auch im Overlay-Modus sichtbar sein.
++    z-index: 10;
++    flex: 0 0 auto;
++    width: 0;
++    height: 100%;
++    overflow: hidden;
++    // Deckende Grundfarbe, damit während der Breiten-Animation nie der
++    // Seitenhintergrund durchscheint.
++    background-color: var(--explorer-sidebar-bg, #ffffff);
++    transition: width 0.15s ease-in-out;
++
++    &:empty {
++      background-color: transparent;
++    }
++  }
++
++  // Bewusst ohne z-index: die Spalte darf keinen eigenen Stacking-Kontext
++  // aufmachen, sonst lägen Excalidraw-Dialoge im Overlay-Modus hinter der
++  // Sidebar.
++  &__canvas {
++    position: relative;
++    flex: 1 1 auto;
++    min-width: 0;
++    height: 100%;
++  }
++
++  &.explorer-panel-open .excalidraw-app__explorerSidebar {
++    width: var(--explorer-panel-width, 280px);
++  }
++
++  // Schmale Viewports: Sidebar legt sich über den Canvas statt ihn zu kürzen.
++  &.explorer-panel-overlay {
++    .excalidraw-app__explorerSidebar {
++      position: absolute;
++      top: 0;
++      bottom: 0;
++      left: 0;
++      box-shadow: 0 0 2rem rgb(0 0 0 / 35%);
++    }
++
++    &.explorer-panel-open .excalidraw-app__explorerSidebar {
++      width: min(var(--explorer-panel-width, 280px), 85vw);
++    }
++  }
++
++  &__explorerBackdrop {
++    position: absolute;
++    top: 0;
++    right: 0;
++    bottom: 0;
++    left: 0;
++    z-index: 9;
++    background-color: rgb(0 0 0 / 35%);
++  }
++}
++
++html.dark .excalidraw-app__explorerSidebar {
++  --explorer-sidebar-bg: #232329;
++}
++
++// Beim Ziehen des Breiten-Griffs darf die Breite nicht nachfedern.
++.excalidraw-app:has(.ExplorerSidebarRoot.is-resizing)
++  .excalidraw-app__explorerSidebar {
++  transition: none;
++}
++
++@media (prefers-reduced-motion: reduce) {
++  .excalidraw-app__explorerSidebar {
++    transition: none;
++  }
++}
++
+ .plus-button {
+   display: flex;
+   justify-content: center;
 -- 
 2.39.5 (Apple Git-154)
 
