@@ -1,7 +1,7 @@
 From 1f58045a06d272c9a824b7b46a2589fe93d577e0 Mon Sep 17 00:00:00 2001
 From: Michael Be <m.gonser@icloud.com>
 Date: Tue, 11 Aug 2026 12:09:55 +0200
-Subject: [PATCH 1/5] feat: add project & file explorer panel
+Subject: [PATCH 1/6] feat: add project & file explorer panel
  (Excalidraw-Plus-style)
 
 Left-docked Files panel with project/file tree backed by /api/explorer:
@@ -1500,7 +1500,7 @@ index 0000000..fd2b326
 From 880c7a4f4d64a6aa2c37b0ccad4bacb17aa849b5 Mon Sep 17 00:00:00 2001
 From: Michael Be <m.gonser@icloud.com>
 Date: Tue, 11 Aug 2026 13:07:56 +0200
-Subject: [PATCH 2/5] fix: explorer E2E findings (autosave loop, stale canvas,
+Subject: [PATCH 2/6] fix: explorer E2E findings (autosave loop, stale canvas,
  dark mode, tree state, z-order)
 
 - content-based dirty detection via scene fingerprint instead of marking
@@ -1760,7 +1760,7 @@ index 93c6bf6..5f02d54 100644
 From 7811a7222381bcc1edd4becc92372f939b39dce4 Mon Sep 17 00:00:00 2001
 From: Michael Be <m.gonser@icloud.com>
 Date: Tue, 11 Aug 2026 13:55:03 +0200
-Subject: [PATCH 3/5] feat: explorer drag & drop and custom dialogs
+Subject: [PATCH 3/6] feat: explorer drag & drop and custom dialogs
 
 - name/delete dialogs built on the package's Dialog/ConfirmDialog/TextField
   (validation, Enter/Escape, autofocus, cascade warning); no native
@@ -2544,7 +2544,7 @@ index 5f02d54..5472438 100644
 From 56d5ce84f2572d20329c13a28c30afd3eecc1e69 Mon Sep 17 00:00:00 2001
 From: Michael Be <m.gonser@icloud.com>
 Date: Tue, 11 Aug 2026 14:53:38 +0200
-Subject: [PATCH 4/5] feat: integrate explorer into native open flow and main
+Subject: [PATCH 4/6] feat: integrate explorer into native open flow and main
  menu
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -3499,7 +3499,7 @@ index d7f701f..3ce72ef 100644
 From 1297989658e006cb32367cace1c72dc8003f2230 Mon Sep 17 00:00:00 2001
 From: Michael Be <m.gonser@icloud.com>
 Date: Thu, 13 Aug 2026 15:10:44 +0200
-Subject: [PATCH 5/5] feat: files explorer as a real, toggleable sidebar
+Subject: [PATCH 5/6] feat: files explorer as a real, toggleable sidebar
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -5220,6 +5220,97 @@ index 24741b0..aebd1e9 100644
  .plus-button {
    display: flex;
    justify-content: center;
+-- 
+2.39.5 (Apple Git-154)
+
+
+From b5cbd554fd67724eed0a79b2ceb845c898215f01 Mon Sep 17 00:00:00 2001
+From: Michael Be <m.gonser@icloud.com>
+Date: Fri, 14 Aug 2026 06:56:39 +0200
+Subject: [PATCH 6/6] feat: swap files toggle and main menu button positions
+
+The floating "Files" button now takes the leftmost slot of the top bar
+and the hamburger moves right by its width; the shift targets the
+relatively positioned MainMenu wrapper so the dropdown follows while the
+shape-properties island below stays flush left. The toggle gets a fixed
+width (--explorer-toggle-width) so both rules share one offset.
+
+Also fixes the toggle covering the mobile toolbar: in overlay layout it
+now sits below the tools island instead of on top of it.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ .../components/explorer/ExplorerPanel.scss    |  9 +++++++--
+ excalidraw-app/index.scss                     | 19 +++++++++++++++++++
+ 2 files changed, 26 insertions(+), 2 deletions(-)
+
+diff --git a/excalidraw-app/components/explorer/ExplorerPanel.scss b/excalidraw-app/components/explorer/ExplorerPanel.scss
+index defeab9..5e2f14e 100644
+--- a/excalidraw-app/components/explorer/ExplorerPanel.scss
++++ b/excalidraw-app/components/explorer/ExplorerPanel.scss
+@@ -20,16 +20,21 @@
+ }
+ 
+ .excalidraw {
++  // Äußerster linker Platz in der Kopfzeile; das Hamburger-Menü rückt dafür
++  // nach rechts (siehe .excalidraw-app in index.scss). Feste Breite, damit
++  // beide Regeln denselben Versatz verwenden.
+   .ExplorerToggle {
+     position: absolute;
+     z-index: 5;
+     top: calc(var(--editor-container-padding) + var(--sat, 0px));
+-    left: calc(var(--editor-container-padding) + 3.25rem);
++    left: calc(var(--editor-container-padding) + var(--sal, 0px));
+     display: flex;
+     align-items: center;
++    justify-content: center;
+     gap: 0.4rem;
++    width: var(--explorer-toggle-width);
+     height: var(--lg-button-size);
+-    padding: 0 0.75rem;
++    padding: 0;
+     border: 0;
+     border-radius: var(--border-radius-lg);
+     background: var(--island-bg-color);
+diff --git a/excalidraw-app/index.scss b/excalidraw-app/index.scss
+index aebd1e9..8893e07 100644
+--- a/excalidraw-app/index.scss
++++ b/excalidraw-app/index.scss
+@@ -80,6 +80,8 @@
+ // Layout: Files-Sidebar als eigene Spalte links, Excalidraw daneben. Der Canvas
+ // liegt dadurch nie unter der Sidebar — kein Überlappen, kein Durchscheinen.
+ .excalidraw-app {
++  --explorer-toggle-width: 5.25rem;
++
+   display: flex;
+   align-items: stretch;
+   width: 100%;
+@@ -121,8 +123,25 @@
+     width: var(--explorer-panel-width, 280px);
+   }
+ 
++  // Bei eingeklappter Sidebar sitzt der Files-Button ganz links, das
++  // Hamburger-Menü rückt um dessen Breite nach rechts. Zielt auf den
++  // relativ positionierten MainMenu-Wrapper, damit das Dropdown mitwandert
++  // und die Eigenschaften-Insel darunter stehen bleibt.
++  &:not(.explorer-panel-open) .App-menu_top__left > :first-child {
++    margin-left: calc(var(--explorer-toggle-width) + 0.5rem);
++  }
++
+   // Schmale Viewports: Sidebar legt sich über den Canvas statt ihn zu kürzen.
+   &.explorer-panel-overlay {
++    // Mobil liegt oben links die Werkzeugleiste — der Files-Button darf sie
++    // nicht verdecken und rückt darunter.
++    .ExplorerToggle {
++      top: calc(
++        var(--editor-container-padding) * 2 + var(--sat, 0px) +
++          var(--lg-button-size) + 0.5rem
++      );
++    }
++
+     .excalidraw-app__explorerSidebar {
+       position: absolute;
+       top: 0;
 -- 
 2.39.5 (Apple Git-154)
 
